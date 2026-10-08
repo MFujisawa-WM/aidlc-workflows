@@ -295,10 +295,11 @@ import {
   settingsSource,
   updateSettingsSection,
   type AidlcSettingsFile,
+  type RecordableProjectBypass,
   type ResolvedAidlcSettings,
   type SettingsTarget,
 } from "./aidlc-settings.ts";
-import { recordSwitchChange, switchesOffLines } from "./aidlc-recorded-switches.ts";
+import { recordSwitchChange, switchesOffLines, unrecordedSwitchLine } from "./aidlc-recorded-switches.ts";
 
 type RootContribution =
   | { policy: "managed-block"; hash: string; marker?: string }
@@ -10432,10 +10433,12 @@ function settingsChangeLines(
     const path = settingsPathForTarget(projectDir, target);
     return target === "global" ? path : relative(projectDir, path);
   };
-  const command = (section: "flags" | "models", args: string[], target: SettingsTarget): string =>
+  // `target` null: the no-layer form, which --clear-bypass reads as "every file
+  // that records the switch"; it is the one way back every other line names.
+  const command = (section: "flags" | "models", args: string[], target: SettingsTarget | null): string =>
     `${configInvocationFor(projectDir)} config ${section} ${
       args.map((arg) => quoteCommandArgument(arg)).join(" ")
-    } --${target} --yes${namedHarness(projectDir, harness)}${projectTarget(projectDir)}`;
+    }${target === null ? "" : ` --${target}`} --yes${namedHarness(projectDir, harness)}${projectTarget(projectDir)}`;
   const lines: string[] = [];
   for (const change of mutations) {
     const file = fileOf(change.target);
@@ -10443,7 +10446,7 @@ function settingsChangeLines(
     const after = new Set(change.next?.flags?.bypasses ?? []);
     for (const name of after) {
       if (!before.has(name)) {
-        lines.push(`Recorded ${name} in ${file}. To undo: ${command("flags", ["--clear-bypass", name], change.target)}`);
+        lines.push(`Recorded ${name} in ${file}. To undo: ${command("flags", ["--clear-bypass", name], null)}`);
       }
     }
     for (const name of before) {
@@ -10808,6 +10811,34 @@ function afterProjectSettings(
       `${files.join(" and ")} changed, but the machine settings file did not: ${reason}. Run the same command again to finish.`,
     );
   }
+}
+
+/**
+ * A `--clear-bypass` of switches that no settings file records would change
+ * nothing, yet the flags path would still create a file and say how open work
+ * picks the change up. When the command is ONLY such clears (plus --yes, a
+ * layer, --project-dir and the output mode), say what is true in one line per
+ * switch and write nothing. Anything else takes the normal path: a name that
+ * is not a switch keeps its error, a change riding beside the clear is made.
+ */
+function unrecordedClearLines(argv: readonly string[], projectDir: string): string[] | null {
+  const clears: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const token = argv[index];
+    if (token === "--clear-bypass" || token === "--project-dir") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) return null;
+      if (token === "--clear-bypass") clears.push(value);
+      index++;
+      continue;
+    }
+    if (["--yes", "--local", "--project", "--global", "--json", "--quiet", "--no-color"].includes(token)) continue;
+    return null;
+  }
+  if (clears.length === 0 || !settingsProjectAvailable(projectDir)) return null;
+  if (!clears.every((name) => (RECORDABLE_PROJECT_BYPASSES as readonly string[]).includes(name))) return null;
+  if (!clears.every((name) => layersRecordingBypass(projectDir, name).length === 0)) return null;
+  return clears.map((name) => unrecordedSwitchLine(projectDir, name as RecordableProjectBypass));
 }
 
 function recordBypassesOnly(
@@ -11193,6 +11224,19 @@ export async function main(
   } else if (section?.value === "flags" || section?.value === "project") {
     const choiceSection = section.value;
     argv = [...argv.slice(0, section.index), ...argv.slice(section.index + 1)];
+    const unrecorded = choiceSection === "flags" && !argv.includes("--show") && !argv.includes("--check") &&
+        !argv.includes("--dry-run") && !argv.includes("--help")
+      ? unrecordedClearLines(argv, projectDirFrom(argv))
+      : null;
+    if (unrecorded !== null) {
+      if (options.mode === "human") {
+        writeMenuLines("", unrecorded);
+        process.exitCode = EXIT.ok;
+      } else {
+        emitResult(success(unrecorded.join(" "), { projectDir: projectDirFrom(argv), changed: false, notes: unrecorded }), options);
+      }
+      return;
+    }
     try {
       const preparedChoices = prepareChoiceSection(
         choiceSection,
