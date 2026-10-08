@@ -143,7 +143,7 @@ import {
   writeFileAtomic,
 } from "./aidlc-lib.ts";
 import { regenerateRunnerSurfaces } from "./aidlc-runner-gen.ts";
-import { KIRO_IDE_STEERING, kiroIdeSteering, repointedIncludeText } from "./aidlc-includes.ts";
+import { KIRO_IDE_STEERING, kiroIdeSteering } from "./aidlc-includes.ts";
 import {
   activeWorkflowPluginDependencies,
   canonicalScopeTableRegion,
@@ -5458,6 +5458,47 @@ function tomlInlineMemberSpan(
   return null;
 }
 
+// The span to cut one member (`key = value`) out of the inline table spanning
+// valueStart..valueEnd, with one of its separating commas, so the table stays
+// well formed: `{ a = 1, b = 2 }` less `b` is `{ a = 1 }`, less `a` is `{ b = 2 }`.
+// Null when the member is not there or the table is not plain.
+function tomlInlineMemberRemoval(
+  content: string,
+  valueStart: number,
+  valueEnd: number,
+  key: string,
+): { start: number; end: number } | null {
+  if (content[valueStart] !== "{" || content[valueEnd - 1] !== "}") return null;
+  const close = valueEnd - 1;
+  let index = valueStart + 1;
+  let previousEnd = -1;
+  while (index < close) {
+    while (index < close && /[\s,]/.test(content[index])) index++;
+    if (index >= close) break;
+    const equals = tomlKeyEquals(content, index, close);
+    if (equals < 0) return null;
+    const parsed = tomlParsedPath(`${content.slice(index, equals)}= 0\n`);
+    const value = tomlValueSpan(content, equals + 1, true, close + 1);
+    if (parsed === null || value === null) return null;
+    if (parsed.length === 1 && parsed[0] === key) {
+      let end = value.valueEnd;
+      let after = end;
+      while (after < close && /[ \t]/.test(content[after])) after++;
+      if (content[after] === ",") {
+        end = after + 1;
+        while (end < close && /[ \t]/.test(content[end])) end++;
+        return { start: index, end };
+      }
+      // The last member: the comma before it goes too.
+      const start = previousEnd >= 0 ? previousEnd : index;
+      return { start, end };
+    }
+    previousEnd = value.valueEnd;
+    index = value.end;
+  }
+  return null;
+}
+
 // The span of the value that defines `path`: its own assignment, wherever the
 // file puts it, or its member inside an enclosing inline table.
 function tomlValueSpanOf(
@@ -5536,7 +5577,8 @@ function codexValueText(value: unknown, skip: ReadonlySet<string> = new Set(), p
 }
 
 const CODEX_VALUE_ENTRY_PREFIX = "value:";
-const CODEX_SPACE_POINTER = JSON.stringify(["shell_environment_policy", "set", "AIDLC_RULES_DIR"]);
+const CODEX_SPACE_POINTER_PATH = ["shell_environment_policy", "set", "AIDLC_RULES_DIR"];
+const CODEX_SPACE_POINTER = JSON.stringify(CODEX_SPACE_POINTER_PATH);
 const CODEX_SPACE_MEMORY = /^aidlc\/spaces\/[^/"\\]+\/memory$/;
 
 function codexValueEntry(path: readonly string[]): string {
@@ -5663,10 +5705,7 @@ function planCodexEntries(
     const legacyKey = leaf[0];
     const record = perValue ? recorded[codexValueEntry(leaf)] : recorded[legacyKey];
     const same = now.found && codexValueText(now.value) === codexValueText(target);
-    const spacePointer = now.found && key === CODEX_SPACE_POINTER &&
-      typeof now.value === "string" && CODEX_SPACE_MEMORY.test(now.value) &&
-      typeof target === "string" && CODEX_SPACE_MEMORY.test(target);
-    if (same || spacePointer) {
+    if (same) {
       expected.set(key, now.value);
       continue;
     }
@@ -5703,7 +5742,7 @@ function planCodexEntries(
     for (const [entry, hash] of Object.entries(recorded)) {
       if (!entry.startsWith(CODEX_VALUE_ENTRY_PREFIX)) continue;
       const path = JSON.parse(entry.slice(CODEX_VALUE_ENTRY_PREFIX.length)) as string[];
-      if (shippedLeaves.has(JSON.stringify(path))) continue;
+      if (shippedLeaves.has(JSON.stringify(path)) || entry === codexValueEntry(CODEX_SPACE_POINTER_PATH)) continue;
       const now = tomlPathValue(currentObject, path);
       if (now.found && sha256Bytes(codexValueText(now.value)) === hash) retired.push(path);
     }
@@ -5722,6 +5761,33 @@ function planCodexEntries(
       if (tomlPathValue(stagedObject, statement.path).found) continue;
       if (leaves.some((leaf) => pathStartsWith(leaf, statement.path))) continue;
       retired.push(statement.path);
+    }
+  }
+
+  // The space pointer earlier releases shipped (`AIDLC_RULES_DIR`, which a
+  // space switch then rewrote) is AI-DLC's whichever space it names, so once
+  // no longer shipped it goes: with its statement (the dotted key, or the
+  // `set = { ... }` table that holds nothing else), or as one member out of a
+  // `set = { ... }` table the project extended, the way a member is added.
+  const retiredMembers: Array<{ path: string[]; start: number; end: number }> = [];
+  if (!shippedLeaves.has(CODEX_SPACE_POINTER)) {
+    const pointer = tomlPathValue(currentObject, CODEX_SPACE_POINTER_PATH);
+    const statement = currentStatements.find((candidate) =>
+      candidate.kind === "assignment" && !candidate.arrayTable && pathStartsWith(CODEX_SPACE_POINTER_PATH, candidate.path)
+    );
+    const table = tomlPathValue(currentObject, CODEX_SPACE_POINTER_PATH.slice(0, 2)).value;
+    if (
+      pointer.found && typeof pointer.value === "string" && CODEX_SPACE_MEMORY.test(pointer.value) &&
+      statement !== undefined
+    ) {
+      const whole = statement.path.length === CODEX_SPACE_POINTER_PATH.length ||
+        (statement.path.length === 2 && isTomlTable(table) && Object.keys(table).length === 1);
+      if (whole) {
+        if (!retired.some((path) => JSON.stringify(path) === JSON.stringify(statement.path))) retired.push(statement.path);
+      } else if (statement.path.length === 2 && current[statement.valueStart] === "{") {
+        const span = tomlInlineMemberRemoval(current, statement.valueStart, statement.valueEnd, CODEX_SPACE_POINTER_PATH[2]);
+        if (span !== null) retiredMembers.push({ path: CODEX_SPACE_POINTER_PATH, ...span });
+      }
     }
   }
 
@@ -5840,6 +5906,9 @@ function planCodexEntries(
     removed.add(existing.statement);
     edits.push({ start: existing.statement.start, end: existing.statement.end, text: "", order: edits.length });
   }
+  for (const member of retiredMembers) {
+    edits.push({ start: member.start, end: member.end, text: "", order: edits.length });
+  }
   // A retired table's header goes with its last setting.
   for (const [at, header] of currentStatements.entries()) {
     if (header.kind !== "header" || header.arrayTable || header.path.length !== 1) continue;
@@ -5871,8 +5940,10 @@ function planCodexEntries(
       return null;
     }
   }
-  for (const path of retired) if (tomlPathValue(mergedObject, path).found) return null;
-  const owned = new Set([...leaves, ...retired].map((path) => JSON.stringify(path)));
+  for (const path of [...retired, ...retiredMembers.map((member) => member.path)]) {
+    if (tomlPathValue(mergedObject, path).found) return null;
+  }
+  const owned = new Set([...leaves, ...retired, ...retiredMembers.map((member) => member.path)].map((path) => JSON.stringify(path)));
   if (codexValueText(mergedObject, owned) !== codexValueText(currentObject, owned)) return null;
 
   const notes: string[] = [];
@@ -8778,17 +8849,18 @@ function workspaceState(rel: string): boolean {
 }
 
 // The hash a managed file counts as: its own, or the known one it equals once
-// line endings Git rewrote (#2057) or the include paths a space switch pointed
-// at another space are set aside; `switched` says it was the latter.
-function ownedFileHash(path: string, known: readonly (string | undefined)[]): { hash: string; switched: boolean } {
+// line endings Git rewrote (#2057) or the include paths an earlier release's
+// space switch pointed at another space are set aside (those files are
+// AI-DLC's, and the refresh writes the shipped file over them).
+function ownedFileHash(path: string, known: readonly (string | undefined)[]): { hash: string } {
   const bytes = readFileSync(path);
   const hash = sha256Matching(bytes, known);
-  if (known.includes(hash)) return { hash, switched: false };
+  if (known.includes(hash)) return { hash };
   const text = bytes.toString("utf-8");
   const shipped = withSpace(text, DEFAULT_SPACE);
-  if (shipped === text) return { hash, switched: false };
+  if (shipped === text) return { hash };
   const asShipped = sha256Matching(shipped, known);
-  return known.includes(asShipped) ? { hash: asShipped, switched: true } : { hash, switched: false };
+  return { hash: known.includes(asShipped) ? asShipped : hash };
 }
 
 function planManagedFiles(
@@ -8921,18 +8993,14 @@ function planManagedFiles(
         actions.push({ path: rel, action: "conflict", detail: "locally modified or unowned" });
         continue;
       }
-      // The update keeps the space the person switched to.
-      const atSpace = owned?.switched ? repointedIncludeText(rel, readFileSync(source, "utf-8"), activeSpace(projectDir)) : null;
-      operations.push(atSpace !== null
-        ? writeOperation(rel, atSpace, expected(target), statSync(source).mode & 0o777)
-        : {
-          kind: "copy",
-          path: rel,
-          source,
-          sourceHash: hash,
-          expected: expected(target),
-          mode: statSync(source).mode & 0o777,
-        });
+      operations.push({
+        kind: "copy",
+        path: rel,
+        source,
+        sourceHash: hash,
+        expected: expected(target),
+        mode: statSync(source).mode & 0o777,
+      });
       actions.push({
         path: rel,
         action: targetExists ? "update" : "create",
@@ -9313,10 +9381,6 @@ function planRootIntegrations(
           });
           continue;
         }
-      }
-      // Include lines a space switch pointed at another space stay there.
-      if (withSpace(current, DEFAULT_SPACE) !== current) {
-        value = repointedIncludeText(integration.path, value, activeSpace(projectDir)) ?? value;
       }
       contributions[integration.path] = {
         policy: "managed-block",
