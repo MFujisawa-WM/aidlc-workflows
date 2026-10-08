@@ -29474,6 +29474,35 @@ function hooksNeverRanHere(projectDir?: string): boolean {
   }
 }
 
+// The prompt hook ran for this workflow just now: the heartbeat it leaves on
+// every prompt it handles is recent by the clock (within the staleness slack,
+// and not from the future) and the work has not moved on since (the newest
+// stage or gate event is within the same slack of it). A refusal for want of a
+// reply then means the person has not answered yet, not a reply the hooks
+// missed. The clock matters: refusals write no stage or gate event, so hooks
+// that stop after a gate opens (a launch whose hook command fails, a Kiro IDE
+// window back in Restricted Mode) would otherwise read as "not answered yet"
+// turn after turn; by the clock the missed-reply step is back within minutes.
+export function promptHookRanRecently(projectDir?: string): boolean {
+  try {
+    const project = resolveProjectDir(projectDir);
+    const path = join(hooksHealthReadDir(project), "record-human-turn.last");
+    if (!existsSync(path)) return false;
+    const beat = Date.parse(readFileSync(path, "utf-8").trim());
+    if (!Number.isFinite(beat)) return false;
+    const age = Date.now() - beat;
+    if (age < 0 || age > HOOK_HEARTBEAT_STALE_SLACK_MS) return false;
+    const newest = hookLiveness(project).newestStageOrGateEvent;
+    return newest === null || newest.timestampMs - beat <= HOOK_HEARTBEAT_STALE_SLACK_MS;
+  } catch {
+    return false;
+  }
+}
+
+// Said in place of the missed-reply line while the prompt hook runs: the gate
+// or question was put to the person, and they have not answered it yet.
+export const NOT_ANSWERED_YET_STEP = "The person has not answered yet: end your turn; their next reply answers it.";
+
 // Said to the agent after every missed-reply step: the person turns a check off, never the agent's offer.
 const NO_CHECK_OFF_OFFER = "Never offer to turn a check off for them.";
 
@@ -29502,6 +29531,12 @@ export function unattendedHumanPresenceHint(projectDir?: string, options: { miss
   }
   // The caller refuses for a reply not given yet, not for one the hooks missed.
   if (options.missedReply === false) return "";
+  // The prompt hook runs here and nothing moved since it last did: the person
+  // has not answered yet (the agent asked in this same turn), so the one step
+  // is to end the turn, and the person hears nothing. Only a reply the hooks
+  // could have missed (no heartbeat, or one the workflow left far behind) gets
+  // the missed-reply line.
+  if (promptHookRanRecently(projectDir)) return ` ${NOT_ANSWERED_YET_STEP}`;
   const activation = hookActivation();
   const host = activation?.missedReplyInHost;
   const missedReply = (inHostShell(host?.env) ? host?.text : activation?.missedReply) ??
