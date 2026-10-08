@@ -65,6 +65,7 @@ import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFil
 import {
   checkSummaryConfirmationEvidence,
   findStageBySlug,
+  hooksHealthDir,
   readAllAuditShards,
   readAuditShardEvents,
   writeSessionPidEntry,
@@ -298,6 +299,28 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
     );
     expect(claude.out).not.toContain("reply again");
     expect(claude.out).not.toContain("Reload Window");
+    // No hook has run in this record: the Kiro IDE tree's refusal carries the
+    // step the agent shows, for the Kiro tool its command runs in (#2167,
+    // measured on Kiro IDE 1.2.37, where an agent given both lines showed the wrong one).
+    const neverIn = (host: NodeJS.ProcessEnv): string => {
+      const r = guarded(proj, ["approve", slug, "--user-input", "Approve"], false, KIRO_IDE_STATE, host);
+      expect(r.rc).not.toBe(0);
+      const refusal = JSON.parse(r.out).error as string;
+      expect(refusal).toContain("do not ask them to answer again");
+      return refusal;
+    };
+    const neverInIde = neverIn({ TERM_PROGRAM: "kiro", KIRO_SESSION_ID: "sess_test" });
+    expect(neverInIde).toContain('Show the person this line: "In Kiro IDE, trust this folder:');
+    expect(neverInIde).toContain("Then run Developer: Reload Window");
+    expect(neverInIde).not.toContain("Kiro CLI");
+    const neverElsewhere = neverIn({});
+    expect(neverElsewhere).toContain('Show the person this line: "In Kiro CLI, quit Kiro');
+    expect(neverElsewhere).not.toContain("Reload Window");
+    // Kiro CLI started from VS Code's terminal carries VS Code's VSCODE_ variables: not Kiro IDE.
+    expect(neverIn({ TERM_PROGRAM: "vscode", VSCODE_PID: "4242" })).toBe(neverElsewhere);
+    // A hook has run here, so the replies below were missed, not unrecordable.
+    mkdirSync(hooksHealthDir(proj), { recursive: true });
+    writeFileSync(join(hooksHealthDir(proj), "record-human-turn.last"), new Date().toISOString());
     const refusalIn = (host: NodeJS.ProcessEnv): string => {
       const r = guarded(proj, ["approve", slug, "--user-input", "Approve"], false, KIRO_IDE_STATE, host);
       expect(r.rc).not.toBe(0);
@@ -325,6 +348,9 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
     const elsewhere = refusalIn({});
     // Another editor's terminal is not Kiro IDE.
     expect(refusalIn({ TERM_PROGRAM: "vscode" })).toBe(elsewhere);
+    // Kiro CLI started from VS Code's terminal: VS Code's own VSCODE_ variables do not make it Kiro IDE.
+    expect(refusalIn({ TERM_PROGRAM: "vscode", VSCODE_PID: "4242" })).toBe(elsewhere);
+    expect(refusalIn({ TERM_PROGRAM: "vscode", VSCODE_IPC_HOOK: "/tmp/vscode-ipc.sock" })).toBe(elsewhere);
     expect(elsewhere).toContain(
       'Tell them exactly this, with nothing about why, then only the line below for the tool they are in: "Your answer was not recorded, so you don\'t need to answer again." In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder. If you drive Kiro from an ACP client, the Kiro IDE guide names what that client must send.',
     );
