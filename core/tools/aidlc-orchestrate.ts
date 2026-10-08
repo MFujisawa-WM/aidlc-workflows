@@ -2869,10 +2869,12 @@ function withdrawRoutedWords(projectDir: string, question: StoredQuestion): void
   }
 }
 
-// A plan the person approved changed before the build, and the change line
-// asked whether to go back to it: their words, in any chat and in any wording,
-// may say yes. The conductor reads that first; the restore itself needs their
-// word on record. Empty when no plan they approved changed.
+// A plan the person approved changed, and the change line asked whether to go
+// back to it: their words, in any chat and in any wording, may say yes. The
+// conductor reads that first; the restore itself needs their word on record.
+// Once the build has started, going back means building that step again from
+// the approved plan: the reading names the restore, and the `next` after it
+// issues that build. Empty when no plan they approved changed.
 function approvedPlanUndoReading(projectDir: string, stateContent: string): string {
   const marker = readActiveDirectiveMarker(projectDir, stateContent);
   if (marker?.version !== 2 || marker.stage !== "code-generation") return "";
@@ -2882,11 +2884,17 @@ function approvedPlanUndoReading(projectDir: string, stateContent: string): stri
   const changed = units.filter((unit) => approvedPlanChangeLine(projectDir, { unit }, issued) !== null);
   if (changed.length === 0) return "";
   const posture = aidlcToolInvocation("testing-posture");
+  // The restore and `next`, after the build has started as before it: the
+  // restore puts the approved content back, so the build `next` issues is the
+  // approved plan's. Naming a reopen beside it undid the person's approval
+  // (its `Reopen: jump` row drops the standing approval, so `next` asked them
+  // to approve again under a line promising the build) and the stage-level
+  // form of that command does not exist (#2084 F1 follow-up).
   const restores = changed.map((unit) =>
     `\`${posture} restore ${unit === null ? "--stage-level" : `--unit ${shellArg(unit)}`}\``);
-  return "A plan the person approved changed before the build, and they were asked whether to go back to it. If " +
-    `their words say to go back to the plan they approved, run ${restores.join(", then ")}, say the line it prints, ` +
-    `then run bare \`${aidlcToolInvocation("orchestrate")} next\`. Otherwise: `;
+  return "A plan the person approved changed, and they were asked whether to go back to it. If " +
+    `their words say to go back to the plan they approved, run ${restores.join(", then ")}, say the line it ` +
+    `prints, then run bare \`${aidlcToolInvocation("orchestrate")} next\`. Otherwise: `;
 }
 
 // Words while a workflow is active may ask to redo, jump to a stage, or start
