@@ -15377,6 +15377,92 @@ function readStableReviewArtifacts(
   }
 }
 
+// A committed text file's bytes as its identity: CRLF reads as LF, so a
+// checkout that turns line endings (Git for Windows' default) is no change to
+// the work. Only a file Git itself converts is read this way; one it takes as
+// binary (a NUL, a lone CR, or more than one control byte in 128 printable
+// ones, as Git's convert.c counts them) is taken as it is, and a file with LF
+// line endings is the same either way.
+export function committedTextBytes(bytes: Buffer): Buffer {
+  if (!bytes.includes(13) || process.env.AIDLC_TEST_RAW_LINE_ENDINGS === "1") return bytes;
+  const parts: Buffer[] = [];
+  return committedTextParts([bytes], (part) => parts.push(part)) ? Buffer.concat(parts) : bytes;
+}
+
+// Hands `emit` the text of `chunks` with each CRLF read as LF, a chunk at a
+// time, and says whether that reading applies: true only for text with a CRLF.
+// The caller takes the raw bytes when it is false.
+function committedTextParts(chunks: Iterable<Buffer>, emit: (part: Buffer) => void): boolean {
+  let crlf = false;
+  let pendingCr = false;
+  let printable = 0;
+  let nonprintable = 0;
+  let last = -1;
+  for (const chunk of chunks) {
+    if (chunk.length === 0) continue;
+    if (pendingCr) {
+      if (chunk[0] !== 10) return false;
+      pendingCr = false;
+    }
+    let start = 0;
+    for (let at = 0; at < chunk.length; at++) {
+      const byte = chunk[at];
+      if (byte === 13) {
+        if (at + 1 === chunk.length) pendingCr = true;
+        else if (chunk[at + 1] !== 10) return false;
+        crlf = true;
+        emit(chunk.subarray(start, at));
+        start = at + 1;
+        at++;
+      } else if (byte === 0) {
+        return false;
+      } else if (byte === 127 || (byte < 32 && byte !== 10 && byte !== 8 && byte !== 9 && byte !== 27 && byte !== 12)) {
+        nonprintable++;
+      } else if (byte !== 10) {
+        printable++;
+      }
+    }
+    emit(chunk.subarray(start));
+    last = chunk[chunk.length - 1];
+  }
+  // A trailing DOS end-of-file mark is not counted against the text.
+  if (last === 26) nonprintable--;
+  return crlf && !pendingCr && (printable >> 7) >= nonprintable;
+}
+
+// The sha256 hex of a committed file's text, as committedTextBytes reads it.
+// A different raw form is remembered, so a value recorded from those bytes
+// before line endings were read as LF still matches.
+export function committedTextSha256(bytes: Buffer): string {
+  const text = committedTextBytes(bytes);
+  const current = createHash("sha256").update(text).digest("hex");
+  if (text !== bytes) rememberRawFingerprint(createHash("sha256").update(bytes).digest("hex"), current);
+  return current;
+}
+
+// Fingerprints this process computed both from the raw bytes (how a value was
+// recorded before line endings were read as LF) and as they are read now. Only
+// content read in this process is here, so a recorded raw value maps to the
+// current form of the same content and nothing else.
+const RAW_FINGERPRINTS = new Map<string, string>();
+const CURRENT_FINGERPRINTS = new Map<string, string>();
+export function rememberRawFingerprint(raw: string, current: string): void {
+  if (raw === current) return;
+  RAW_FINGERPRINTS.set(raw, current);
+  CURRENT_FINGERPRINTS.set(current, raw);
+}
+// A recorded fingerprint in its current form: the value as recorded, or, when
+// it was taken over raw line endings of content read here, that content's
+// current fingerprint.
+export function currentFingerprintForm(value: string | null): string | null {
+  return value === null ? null : RAW_FINGERPRINTS.get(value) ?? value;
+}
+// The raw-bytes form of a current fingerprint this process computed, if it
+// differs.
+export function rawFingerprintForm(value: string | null): string | null {
+  return value === null ? null : CURRENT_FINGERPRINTS.get(value) ?? null;
+}
+
 function reviewArtifactContentsFingerprint(
   contents: ReviewArtifactContent[],
   options: {
@@ -15386,26 +15472,34 @@ function reviewArtifactContentsFingerprint(
   } = {},
 ): string | null {
   const manifest: Array<[string, string]> = [];
+  // The same manifest over raw bytes, as it was recorded before line endings
+  // were read as LF; remembered when it differs.
+  const rawManifest: Array<[string, string]> = [];
+  let rawDiffers = false;
   let matchedAppendix = options.appendixArtifact === undefined;
   for (const entry of contents) {
     if (entry.summaryInput) {
       if (entry.state !== "file" && entry.required && options.requireRequiredArtifacts === true) return null;
-      manifest.push([
+      const value: [string, string] = [
         entry.logicalPath,
         entry.state === "file"
           ? `summary-input:sha256:${summaryInputReviewFingerprint(entry.body)}`
           : entry.state,
-      ]);
+      ];
+      manifest.push(value);
+      rawManifest.push(value);
       continue;
     }
     if (entry.state === "missing") {
       if (entry.required && options.requireRequiredArtifacts === true) return null;
       manifest.push([entry.logicalPath, "missing"]);
+      rawManifest.push([entry.logicalPath, "missing"]);
       continue;
     }
     if (entry.state === "not-file") {
       if (entry.required && options.requireRequiredArtifacts === true) return null;
       manifest.push([entry.logicalPath, "not-file"]);
+      rawManifest.push([entry.logicalPath, "not-file"]);
       continue;
     }
 
@@ -15422,11 +15516,17 @@ function reviewArtifactContentsFingerprint(
       fingerprintedBody = entry.body.subarray(0, options.appendixOffset);
       matchedAppendix = true;
     }
-    const digest = createHash("sha256").update(fingerprintedBody).digest("hex");
-    manifest.push([entry.logicalPath, `sha256:${digest}`]);
+    const text = committedTextBytes(fingerprintedBody);
+    manifest.push([entry.logicalPath, `sha256:${createHash("sha256").update(text).digest("hex")}`]);
+    rawManifest.push([entry.logicalPath, `sha256:${createHash("sha256").update(fingerprintedBody).digest("hex")}`]);
+    if (text !== fingerprintedBody) rawDiffers = true;
   }
   if (!matchedAppendix) return null;
-  return `sha256:${createHash("sha256").update(JSON.stringify(manifest)).digest("hex")}`;
+  const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify(manifest)).digest("hex")}`;
+  if (rawDiffers) {
+    rememberRawFingerprint(`sha256:${createHash("sha256").update(JSON.stringify(rawManifest)).digest("hex")}`, fingerprint);
+  }
+  return fingerprint;
 }
 
 export interface ReviewArtifactSnapshot {
@@ -15980,10 +16080,7 @@ export function reviewRequestBindingFromBlock(
   ) {
     return null;
   }
-  const unitSourceFingerprint = auditBlockField(
-    block,
-    "Unit Source Fingerprint",
-  );
+  const unitSourceFingerprint = auditBlockField(block, "Unit Source Fingerprint");
   if (
     unitSourceFingerprint !== null &&
     !UNIT_SOURCE_FINGERPRINT_RE.test(unitSourceFingerprint)
@@ -16061,10 +16158,7 @@ export function reviewCompletionMatchesRequest(
 ): boolean {
   const verdict = auditBlockField(completionBlock, "Verdict");
   if (verdict !== "READY" && verdict !== "NOT-READY") return false;
-  const recordedFingerprint = auditBlockField(
-    completionBlock,
-    "Artifact Fingerprint",
-  );
+  const recordedFingerprint = auditBlockField(completionBlock, "Artifact Fingerprint");
   if (
     recordedFingerprint === null ||
     !REVIEW_FINGERPRINT_RE.test(recordedFingerprint)
@@ -17470,7 +17564,8 @@ export function reviewArtifactBytesSnapshot(
         safePath,
         `review artifact ${entry.logicalPath}`,
       );
-      const digest = createHash("sha256").update(bytes).digest("hex");
+      // CRLF text reads as LF, as review receipts record it.
+      const digest = createHash("sha256").update(committedTextBytes(bytes)).digest("hex");
       manifest.push([
         entry.logicalPath,
         entry.summaryInput
@@ -18487,9 +18582,11 @@ export function reviewRequestArtifactsCurrent(
   binding: ReviewRequestBinding,
   snapshot: ReviewArtifactSnapshot,
 ): boolean {
+  // A request recorded over raw line endings reads in its current form.
+  const requested = currentFingerprintForm(binding.artifactFingerprint) ?? binding.artifactFingerprint;
   return binding.legacyAppendix !== null
-    ? snapshot.bodyFingerprints.includes(binding.artifactFingerprint)
-    : snapshot.fingerprint === binding.artifactFingerprint;
+    ? snapshot.bodyFingerprints.includes(requested)
+    : snapshot.fingerprint === requested;
 }
 
 // Deprecated migration tolerance: a reviewer that still appends `## Review` to
@@ -18503,9 +18600,10 @@ export function reviewAppendedAfterRequest(
   snapshot: ReviewArtifactSnapshot,
 ): boolean {
   if (snapshot.appendix.length === 0) return false;
-  if (!snapshot.bodyFingerprints.includes(binding.artifactFingerprint)) return false;
+  const requested = currentFingerprintForm(binding.artifactFingerprint) ?? binding.artifactFingerprint;
+  if (!snapshot.bodyFingerprints.includes(requested)) return false;
   return binding.legacyAppendix === null
-    ? snapshot.fingerprint !== binding.artifactFingerprint
+    ? snapshot.fingerprint !== requested
     : !binding.legacyAppendix.priorAppendix;
 }
 
@@ -18584,7 +18682,7 @@ export function pendingRequestCurrency(
             );
       if (
         binding.unitSourceFingerprint !== null &&
-        currentUnitSource !== binding.unitSourceFingerprint
+        currentUnitSource !== currentFingerprintForm(binding.unitSourceFingerprint)
       ) {
         requestCurrent = false;
       }
@@ -18919,7 +19017,7 @@ export function candidateReviewCoverageProjection(
     pending.delete(iteration);
     ready =
       auditBlockField(event.block, "Verdict") === "READY" &&
-      auditBlockField(event.block, "Artifact Fingerprint") ===
+      currentFingerprintForm(auditBlockField(event.block, "Artifact Fingerprint")) ===
         options.expectedFingerprint;
   }
   return ready;
@@ -19417,7 +19515,7 @@ export function freshReviewReceipts(
     const fingerprintUsable =
       artifactFingerprintUsable && currentFingerprint !== null;
     const fingerprintMatches =
-      fingerprintUsable && recordedFingerprint === currentFingerprint;
+      fingerprintUsable && currentFingerprintForm(recordedFingerprint) === currentFingerprint;
     const terminalVerdict = request.recovery
       ? verdict
       : terminalReviewVerdict(
@@ -19712,7 +19810,7 @@ export function freshReviewReceipts(
           receipt.fingerprint,
         );
         const manifest = readUnitSourceManifest(projectDir, stage.slug, unit);
-        if (snapshot === null || !manifest.ok || snapshot.manifestSha256 !== manifest.rawBytesSha256) {
+        if (snapshot === null || !manifest.ok || currentFingerprintForm(snapshot.manifestSha256) !== manifest.rawBytesSha256) {
           if (!isRelaxed()) {
             stale = true;
           } else if (snapshot === null || !manifest.ok) {
@@ -20340,6 +20438,7 @@ export function sameWorkspaceSource(
   if (recorded === current) return true;
   if (recorded == null || current == null) return false;
   return legacyWorkspaceSourceAliases.get(current) === recorded ||
+    currentFingerprintForm(recorded) === current ||
     earlierBoundaryWorkspaceSources(current).includes(recorded);
 }
 
@@ -21102,6 +21201,8 @@ export function sourceListingEntriesEqual(
 ): boolean {
   if (left === right) return true;
   if (left === undefined || right === undefined) return false;
+  // An entry recorded over raw line endings of a file read here is that file.
+  if (currentFingerprintForm(left) === currentFingerprintForm(right)) return true;
   const leftModern =
     /^\d{6} ((?:[0-9a-f]{40}|[0-9a-f]{64}))$/.exec(left);
   const rightModern =
@@ -21747,31 +21848,46 @@ function isAidlcSensorCachePath(path: string): boolean {
   return false;
 }
 
-function stableFileSha256(path: string): string | null {
+// A source file's sha256 with its line endings read as LF (committedTextBytes),
+// so a checkout that turns them is no change, and the raw bytes' digest when
+// that differs. The file is read a chunk at a time, never whole; only one with
+// a CR is read a second time, for its text form.
+function stableFileShas(path: string): { sha: string; raw?: string } | null {
   let fd: number | undefined;
   try {
     fd = openSync(path, "r");
-    const before = fstatSync(fd);
+    const opened = fd;
+    const before = fstatSync(opened);
     if (!before.isFile()) return null;
-    const hash = createHash("sha256");
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
-    while (true) {
-      const count = readSync(fd, buffer, 0, buffer.length, position);
-      if (count === 0) break;
-      hash.update(buffer.subarray(0, count));
-      position += count;
+    const chunks = function* (): Generator<Buffer> {
+      for (position = 0; ; ) {
+        const count = readSync(opened, buffer, 0, buffer.length, position);
+        if (count === 0) return;
+        position += count;
+        yield buffer.subarray(0, count);
+      }
+    };
+    const unchanged = (): boolean => {
+      const after = fstatSync(opened);
+      return before.size === after.size &&
+        before.mtimeMs === after.mtimeMs &&
+        before.ctimeMs === after.ctimeMs &&
+        position === after.size;
+    };
+    const hash = createHash("sha256");
+    let carriageReturn = false;
+    for (const chunk of chunks()) {
+      hash.update(chunk);
+      carriageReturn ||= chunk.includes(13);
     }
-    const after = fstatSync(fd);
-    if (
-      before.size !== after.size ||
-      before.mtimeMs !== after.mtimeMs ||
-      before.ctimeMs !== after.ctimeMs ||
-      position !== after.size
-    ) {
-      return null;
-    }
-    return hash.digest("hex");
+    if (!unchanged()) return null;
+    const raw = hash.digest("hex");
+    if (!carriageReturn || process.env.AIDLC_TEST_RAW_LINE_ENDINGS === "1") return { sha: raw };
+    const text = createHash("sha256");
+    if (!committedTextParts(chunks(), (part) => text.update(part))) return { sha: raw };
+    return unchanged() ? { sha: text.digest("hex"), raw } : null;
   } catch {
     return null;
   } finally {
@@ -21783,6 +21899,10 @@ function stableFileSha256(path: string): string | null {
       }
     }
   }
+}
+
+function stableFileSha256(path: string): string | null {
+  return stableFileShas(path)?.sha ?? null;
 }
 
 interface FilesystemSourceIdentity {
@@ -22487,6 +22607,8 @@ function filesystemSourceIdentity(
   const sourceBasename =
     /^(?:BUILD|CMakeLists\.txt|Dockerfile(?:\..+)?|Gemfile|Justfile|Makefile|Procfile|Tiltfile|WORKSPACE)$/i;
   const lines: string[] = [];
+  // The raw form of a file line, by its index in `lines`, where line endings made it differ.
+  const rawLines = new Map<number, string>();
   // Lines only the earlier walk recorded (files now excluded by name), each
   // kept at the index it held there, so evidence recorded before the exclusion
   // still compares equal when nothing actually changed.
@@ -22807,14 +22929,20 @@ function filesystemSourceIdentity(
         );
       }
     }
-    const sha = stableFileSha256(path);
-    if (sha === null) {
+    const shas = stableFileShas(path);
+    if (shas === null) {
       return noteSourceFailure(false, "unreadable", "the file could not be hashed", rel);
     }
+    const { sha, raw } = shas;
     lines.push(`file:${rel}:${executable ? "x" : "-"}=${sha}`);
     const entry = sourceListingEntry(executable ? "100755" : "100644", sha);
     if (entry === null) {
       return noteSourceFailure(false, "walk-failed", "the file produced no listing entry", rel);
+    }
+    if (raw !== undefined) {
+      // As recorded before line endings were read as LF.
+      rawLines.set(lines.length - 1, `file:${rel}:${executable ? "x" : "-"}=${raw}`);
+      rememberRawFingerprint(`${executable ? "100755" : "100644"} ${raw}`, entry);
     }
     listing.set(listingPath, entry);
     return true;
@@ -23315,15 +23443,24 @@ function filesystemSourceIdentity(
     }
     return null;
   }
+  const filesystemFingerprint = createHash("sha256")
+    .update(["aidlc-filesystem-source-v2", ...lines].join("\n"))
+    .digest("hex");
+  if (rawLines.size > 0) {
+    rememberRawFingerprint(
+      createHash("sha256")
+        .update(["aidlc-filesystem-source-v2", ...lines.map((line, at) => rawLines.get(at) ?? line)].join("\n"))
+        .digest("hex"),
+      filesystemFingerprint,
+    );
+  }
   return {
     dotnetOutputSeen,
     embeddedGitPaths: [...embeddedGitPaths].sort(),
     excludedOutputPathspecs: [...excludedOutputPathspecs].sort(),
     excludedSymlinkPathspecs: [...excludedSymlinkPathspecs].sort(),
     externalSymlinkPaths: [...externalSymlinkPaths].sort(),
-    fingerprint: createHash("sha256")
-      .update(["aidlc-filesystem-source-v2", ...lines].join("\n"))
-      .digest("hex"),
+    fingerprint: filesystemFingerprint,
     ...(legacyInserts.length > 0 && !legacyUnavailable
       ? { legacyFingerprint: legacyFilesystemFingerprint(lines, legacyInserts) }
       : {}),
@@ -23546,6 +23683,8 @@ function walkWorkspaceSource(
       createHash("sha256")
         .update(["aidlc-workspace-source-v2", `filesystem=${filesystem}`].join("\n"))
         .digest("hex");
+    const rawSource = rawFingerprintForm(source.fingerprint);
+    if (rawSource !== null) rememberRawFingerprint(workspaceDigest(rawSource), workspaceDigest(source.fingerprint));
     return {
       state: {
         fingerprint: workspaceDigest(source.fingerprint),
@@ -23595,6 +23734,12 @@ function walkWorkspaceSource(
   }
   const digest = (parts: readonly string[]): string =>
     createHash("sha256").update(["aidlc-workspace-source-v2", ...parts].join("\n")).digest("hex");
+  // As recorded before line endings were read as LF.
+  const rawParts = lines.map((line) => line.replace(/=filesystem:([0-9a-f]{64})$/, (whole, hex: string) => {
+    const raw = rawFingerprintForm(hex);
+    return raw === null ? whole : `=filesystem:${raw}`;
+  }));
+  if (rawParts.some((line, at) => line !== lines[at])) rememberRawFingerprint(digest(rawParts), digest(lines));
   return {
     state: { fingerprint: digest(lines), listing },
     legacy: legacyDiffers ? digest(legacyLines) : null,
@@ -24684,7 +24829,7 @@ function validateUnitSourceManifestBytes(
     manifest: { stage: stageSlug, unit, version: 1, writes },
     claims,
     prefixes,
-    rawBytesSha256: createHash("sha256").update(rawBytes).digest("hex"),
+    rawBytesSha256: committedTextSha256(rawBytes),
   };
   } finally {
     for (const index of pathModeIndexes.values()) {
@@ -24784,7 +24929,24 @@ export function unitSourceFingerprint(
   claimModel: SourceClaimModel,
   manifestSha256: string,
 ): string {
-  return `sha256:${sourceListingSha256(serializeUnitSourceListing(listing, claimModel, manifestSha256))}`;
+  const fingerprint = `sha256:${sourceListingSha256(serializeUnitSourceListing(listing, claimModel, manifestSha256))}`;
+  // The same listing over raw bytes (the files' and the manifest's), as
+  // recorded before line endings were read as LF.
+  const rawManifest = rawFingerprintForm(manifestSha256);
+  let rawListing: Map<string, string> | null = null;
+  for (const [key, entry] of listing) {
+    const raw = rawFingerprintForm(entry);
+    if (raw === null) continue;
+    rawListing ??= new Map(listing);
+    rawListing.set(key, raw);
+  }
+  if (rawManifest !== null || rawListing !== null) {
+    rememberRawFingerprint(
+      `sha256:${sourceListingSha256(serializeUnitSourceListing(rawListing ?? listing, claimModel, rawManifest ?? manifestSha256))}`,
+      fingerprint,
+    );
+  }
+  return fingerprint;
 }
 
 /** Parse committed reviewed-source evidence bytes (the serializeUnitSourceListing
@@ -24974,8 +25136,13 @@ function readSourceSnapshot(path: string, fingerprint: string): string | null {
   if (expected === null) return null;
   try {
     const bytes = readFileSync(path);
-    if (createHash("sha256").update(bytes).digest("hex") !== expected) return null;
-    return bytes.toString("utf-8");
+    const text = committedTextBytes(bytes);
+    // A checkout with CRLF line endings holds the same listing.
+    if (
+      createHash("sha256").update(text).digest("hex") !== expected &&
+      createHash("sha256").update(bytes).digest("hex") !== expected
+    ) return null;
+    return text.toString("utf-8");
   } catch {
     return null;
   }
@@ -34874,7 +35041,7 @@ export function unitLifecycleSnapshot(
           : reviewArtifactFingerprint(projectDir, stage, row.unit, {
               requireRequiredArtifacts: true,
             });
-    if (waveCompletionHolds(recorded, current, options.keepChangedWaveCompletions === true)) {
+    if (waveCompletionHolds(currentFingerprintForm(recorded), current, options.keepChangedWaveCompletions === true)) {
       receipts.add(row.unit);
     } else {
       receipts.delete(row.unit);
@@ -34930,7 +35097,7 @@ export function unitCompletedReceipts(
         : reviewArtifactFingerprint(projectDir, stage, row.unit, {
             requireRequiredArtifacts: true,
           });
-    if (waveCompletionHolds(recorded, current, options.keepChangedWaveCompletions === true)) {
+    if (waveCompletionHolds(currentFingerprintForm(recorded), current, options.keepChangedWaveCompletions === true)) {
       done.add(row.unit);
     } else {
       done.delete(row.unit);
