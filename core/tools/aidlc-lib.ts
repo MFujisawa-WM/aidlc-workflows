@@ -1,7 +1,7 @@
 import { DEFAULT_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { accessSync, chmodSync, closeSync, constants as fsConstants, cpSync, type Dirent, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants as fsConstants, cpSync, type Dirent, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26646,15 +26646,20 @@ export function turnEndIsOpen(projectDir: string, intent?: string, space?: strin
 }
 
 // Record that the workflow engine was ADVANCED (not merely probed). Called from
-// orchestrate's `next` / `report` / `park` and `intent create`. A no-op in three
-// cases: when STOP_HOOK_PROBE_ENV is set (the Stop hook's own probe — see above),
-// for read-only utility routing (excluded at the call site), and before creation.
+// orchestrate's `next` / `report` / `park`, from `intent create` for the work it
+// creates, and from the intent and space switches for the work they select (a
+// record with no mark, made before the markers shipped or freshly cloned, would
+// otherwise read every later plain question as the engine's unfinished turn on
+// the transcript-free hosts). A no-op in three cases: when STOP_HOOK_PROBE_ENV
+// is set (the Stop hook's own probe, see above), for read-only utility routing
+// (excluded at the call site), and before creation.
 //
 // KNOWN COVERAGE GAP — the marker sees LESS than the transcript predicate does.
 // isEngineToolCall (below) counts as engagement any non-read-only aidlc-jump /
 // aidlc-bolt / aidlc-swarm invocation and the mutating aidlc-state verbs
 // (approve, advance, skip, set, …). NONE of those tools touch this marker: the
-// only writers are orchestrate's three subcommands and intent create. So on a transcript-free
+// only writers are orchestrate's three subcommands, intent create and the two
+// switches. So on a transcript-free
 // harness a conductor that runs, say, `aidlc-jump` — mutating the stage pointer
 // and emitting audit — and then ends its turn without consulting the engine
 // reads as CONVERSATIONAL here, while the same turn BLOCKS on Claude/Codex where
@@ -26672,6 +26677,32 @@ export function markEngineTouch(projectDir: string, intent?: string, space?: str
   if (isReadOnlyEngineProbe()) return;
   if (!workflowIsCreated(projectDir, intent, space)) return;
   touchTurnMarker(projectDir, "engine-touch", intent, space);
+}
+
+// The engine mark for the work an intent or space switch selects. Written only
+// when the record has none (work made before the markers shipped, or a fresh
+// clone: .aidlc-engine/ is not committed), and dated just before the record's
+// last human turn when it has one. So the switch itself never reads as the
+// engine's unfinished turn: a self-switch on marked work (a new chat's first
+// `/aidlc intent <the work in hand>`, or the resume offer's Yes) ends its turn
+// as it always did, a plain question on the selected work ends its turn too,
+// and work the engine hands out later refreshes the mark as always.
+export function markSelectedWork(projectDir: string, intent?: string, space?: string): void {
+  try {
+    if (turnMarkerStat(projectDir, "engine-touch", intent, space)?.isFile()) return;
+  } catch {
+    return; // a link on the way reads as no mark, and nothing is written through it
+  }
+  markEngineTouch(projectDir, intent, space);
+  try {
+    const human = turnMarkerStat(projectDir, "human-turn", intent, space);
+    if (!human?.isFile()) return;
+    const mark = recordFileTargetOrThrow(docsRoot(projectDir, intent, space), join(ENGINE_DIR, "engine-touch"));
+    const before = new Date(human.mtimeMs - 1000);
+    utimesSync(mark, before, before);
+  } catch {
+    // Advisory: the mark's own time stands.
+  }
 }
 
 // The transcript-free reading of "the ending turn was conversational": the last
