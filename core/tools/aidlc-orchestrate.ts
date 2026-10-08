@@ -3530,6 +3530,30 @@ function stillParkedLine(): string {
   return "Your work is still paused. Do you want to pick it back up now?";
 }
 
+// Where the work picks up, said with a setting the person typed, so the agent
+// has nothing to guess from Current Stage (under a Unit-by-Unit walk it stays
+// on the block's first stage while a Unit works through the later ones; a live
+// run read "we'll pick up at Functional Design" at Unit 2's Code Generation and
+// at its checkpoint). The walk's own step names it: the Unit's stage, the
+// summary confirmation after one, or the Unit's checkpoint. A paused walk is
+// already said to be paused, and a block whose Units are all covered has no
+// step of its own, so neither gets a line. Off a Unit walk, Current Stage is it.
+function withWorkPicksUpLine<T extends Directive>(directive: T, pd: string, scope: string, stateContent: string): T {
+  const current = (getField(stateContent, "Current Stage") ?? "").trim();
+  const walk = scope ? unitMajorWalkBeat(pd, scope, stateContent, current) : null;
+  const at = walk === null
+    ? nodeForSlug(current)?.name ?? ""
+    : walk.step.kind === "work"
+      ? `${walk.step.stage.name} for ${walk.step.unit}`
+      : walk.step.kind === "summary"
+        ? `the summary confirmation of ${walk.step.stage.name} for ${walk.step.unit}`
+        : walk.step.kind === "checkpoint"
+          ? `the Unit checkpoint for ${walk.step.unit}`
+          : "";
+  if (at) (directive as { narration?: string }).narration = `The work picks up at ${at}.`;
+  return directive;
+}
+
 // For the agent, after the still-paused line: what a yes to it runs.
 function resumeOnYes(): string {
   return ` If they say yes, run \`${aidlcToolInvocation("orchestrate")} next --resume\`.`;
@@ -8189,7 +8213,10 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     if (modifiers.length > 0 && !describedWork) {
       const command = configSetCommand(modifiers);
       emit(planChanges ? planChangeDirective(planChanges, command, plan, planApprovalAskIsOpen(pd), stillParked) : keptWhilePlanWaits(
-        turnEndingPrint(`Run \`${command}\` to update the configuration, then ${verbatimThenStop}`),
+        withWorkPicksUpLine(
+          turnEndingPrint(`Run \`${command}\` to update the configuration, then ${verbatimThenStop}`),
+          pd, currentStateScope, stateContent,
+        ),
         planApprovalAskIsOpen(pd),
       ));
       return;
@@ -8202,9 +8229,12 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     // and no stage work starts from it.
     if (!describedWork && !flags.resume && typedSettingModifiers(flags).length > 0) {
       emit(keptWhilePlanWaits(
-        turnEndingPrint(stillParked === null
-          ? "The setting the person typed is already applied: say the line it printed, then stop."
-          : `The setting the person typed is already applied: say the line it printed followed by "${stillParked}", then stop.${resumeOnYes()}`),
+        withWorkPicksUpLine(
+          turnEndingPrint(stillParked === null
+            ? "The setting the person typed is already applied: say the line it printed, then stop."
+            : `The setting the person typed is already applied: say the line it printed followed by "${stillParked}", then stop.${resumeOnYes()}`),
+          pd, currentStateScope, stateContent,
+        ),
         planApprovalAskIsOpen(pd),
       ));
       return;
