@@ -34,6 +34,7 @@ import { delimiter, dirname, join, posix, resolve, win32 } from "node:path";
 import {
   acquireAuditLock,
   auditLockDir,
+  committedTextBytes,
   releaseAuditLock,
 } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
 import {
@@ -2217,6 +2218,87 @@ describe("t188 plugin compose — emit + compose the contribution seam", () => {
       expect(readFileSync(installedAgent, "utf-8")).toContain("RESHAPE-UPDATE marker");
     });
   }
+
+  // What Git for Windows does at checkout (core.autocrlf=true): every committed
+  // text file gets CRLF. Line endings alone are not a change to the plugin's
+  // files, so a re-compose on such a checkout must drop nothing and rewrite
+  // nothing, and doctor's composed-surface check must still find every fragment.
+  function checkOutWithCrlf(dir: string): number {
+    let converted = 0;
+    for (const name of readdirSync(dir)) {
+      if (name === ".git" || name.startsWith(".aidlc-")) continue;
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) {
+        converted += checkOutWithCrlf(path);
+        continue;
+      }
+      if (!/\.(md|json|tsv|ts|cjs|js|yaml|yml|txt)$/.test(name)) continue;
+      const text = readFileSync(path, "utf-8");
+      if (text.includes("\r") || !text.includes("\n")) continue;
+      writeFileSync(path, text.replace(/\n/g, "\r\n"));
+      converted++;
+    }
+    return converted;
+  }
+
+  test("re-composing on a CRLF checkout changes nothing and keeps doctor green", () => {
+    const crlfProject = composePluginFixture({
+      plugin: PLUGIN,
+      harness: "claude",
+      projectDir: join(tmp, "crlf-checkout"),
+      pluginBuilt,
+    }).projectDir;
+    expect(checkOutWithCrlf(crlfProject)).toBeGreaterThan(0);
+    const stagePath = stageSourcePath(crlfProject, "construction", "build-and-test");
+    const before = readFileSync(stagePath);
+
+    const rerun = spawnSync(BUN, [join(pluginBuilt, "hooks", "compose.ts")], {
+      cwd: crlfProject,
+      encoding: "utf-8",
+      timeout: remainingOperationTimeoutMs(NATIVE_RUNTIME_CASE_TIMEOUT_MS),
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: pluginBuilt,
+        CLAUDE_PROJECT_DIR: crlfProject,
+        AIDLC_HARNESS_DIR: ".claude",
+      },
+    });
+    expect(rerun.status, rerun.stderr).toBe(0);
+    expect(hookDrops(crlfProject)).toBe("");
+    expect(readFileSync(stagePath).equals(before)).toBe(true);
+
+    const doctor = spawnSync(BUN, [join(crlfProject, ".claude", "tools", "aidlc-utility.ts"), "doctor", "--verbose"], {
+      cwd: crlfProject, encoding: "utf-8", timeout: remainingOperationTimeoutMs(NATIVE_RUNTIME_CASE_TIMEOUT_MS),
+      env: { ...process.env, CLAUDE_PROJECT_DIR: crlfProject },
+    });
+    const surfaceRow = `${doctor.stdout}${doctor.stderr}`.split("\n").find((l) => l.includes("Composed plugin surface"));
+    expect(surfaceRow).toBeDefined();
+    expect(surfaceRow!.trimStart().startsWith("fail")).toBe(false);
+  });
+
+  // A record written before the committed-text rule holds the raw-bytes digest
+  // of a CRLF file. Identical bytes are no change, so compose still takes the
+  // plugin's newer copy and writes the record over the committed text.
+  test("a record written over raw CRLF bytes still proves the plugin's own copy to compose", () => {
+    const name = "syn-rawrecord";
+    const { proj } = composeSynthetic(name, upgradeFiles(name, "v1", "after-step:8"));
+    expect(checkOutWithCrlf(proj)).toBeGreaterThan(0);
+    const recordPath = join(proj, ".claude", "tools", "data", `plugin-owned-${name}.json`);
+    type Record = { files: Array<{ path: string; sha256: string }> };
+    const digest = (rel: string, read: (bytes: Buffer) => Buffer) =>
+      `sha256:${createHash("sha256").update(read(readFileSync(join(proj, rel)))).digest("hex")}`;
+    const record = JSON.parse(readFileSync(recordPath, "utf-8")) as Record;
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify({ ...record, files: record.files.map((file) => ({ ...file, sha256: digest(file.path, (bytes) => bytes) })) }, null, 2)}\n`,
+    );
+
+    const drops = recomposeSynthetic(proj, name, upgradeFiles(name, "v2", "after-step:8"));
+    expect(drops).not.toContain("not overwritten");
+    expect(readFileSync(join(proj, ".claude", "tools", "aidlc-sensor-syn-upgrade-check.ts"), "utf-8")).toContain("sensor v2");
+    const rewritten = JSON.parse(readFileSync(recordPath, "utf-8")) as Record;
+    for (const file of rewritten.files) expect(file.sha256).toBe(digest(file.path, committedTextBytes));
+  });
 
   // A plugin built with an AI-DLC from before the plugin file record carries a
   // compose hook that neither writes nor removes tools/data/plugin-owned-<key>.json.

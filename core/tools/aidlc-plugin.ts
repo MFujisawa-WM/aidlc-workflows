@@ -17,6 +17,7 @@ import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { DEFAULT_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
 import {
+  committedTextBytes,
   errorMessage,
   parseArgs,
   resolveProjectDir,
@@ -826,8 +827,22 @@ export function renderPluginStatuses(statuses: PluginStatus[], verbose = false):
   return `${[render(headings), ...values.map(render)].join("\n")}\n`;
 }
 
+// A file's identity is its committed text: CRLF reads as LF, so a checkout
+// that turns line endings (Git for Windows' default) is no change to a plugin's
+// files and never a refusal.
 function sha256File(path: string): string {
-  return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+  return `sha256:${createHash("sha256").update(committedTextBytes(readFileSync(path))).digest("hex")}`;
+}
+
+// Does a recorded digest still name this file? A record written before the
+// committed-text rule holds the raw-bytes digest of a CRLF file (a plugin root
+// that is itself a CRLF clone); identical bytes are no change either, so that
+// record proves the file too. The next record is written over the committed
+// text.
+function recordedDigestMatches(path: string, recorded: string): boolean {
+  const bytes = readFileSync(path);
+  const digest = (data: Buffer): string => `sha256:${createHash("sha256").update(data).digest("hex")}`;
+  return digest(committedTextBytes(bytes)) === recorded || digest(bytes) === recorded;
 }
 
 function pluginPrimitiveTargets(
@@ -890,9 +905,9 @@ function writeCompositionRecords(
       if (
         !existsSync(target) ||
         !lstatSync(target).isFile() ||
-        sha256File(target) !== file.sha256
+        !recordedDigestMatches(target, file.sha256)
       ) continue;
-      files.set(file.path, { path: file.path, sha256: file.sha256 });
+      files.set(file.path, { path: file.path, sha256: sha256File(target) });
       claimedPaths.add(file.path);
     }
   } else {
@@ -901,14 +916,15 @@ function writeCompositionRecords(
     for (const candidate of pluginPrimitiveTargets(plugin, stagedProject, harnessDir)) {
       if (claimedPaths.has(candidate.path)) continue;
       const target = join(stagedProject, candidate.path);
+      const projected = committedTextBytes(projectedSourceBytes(candidate.source, harnessDir));
       if (
         !lstatSync(target).isFile() ||
-        !readFileSync(target).equals(projectedSourceBytes(candidate.source, harnessDir))
+        !committedTextBytes(readFileSync(target)).equals(projected)
       ) continue;
       const liveTarget = join(liveProject, candidate.path);
       const legacyMatch = existsSync(liveTarget) &&
         lstatSync(liveTarget).isFile() &&
-        readFileSync(liveTarget).equals(projectedSourceBytes(candidate.source, harnessDir));
+        committedTextBytes(readFileSync(liveTarget)).equals(projected);
       if (existsSync(liveTarget) && !legacyMatch && !priorOwnedPaths.has(candidate.path)) continue;
       files.set(candidate.path, {
         path: candidate.path,
@@ -1215,7 +1231,7 @@ function pruneOwnedPlugin(
   for (const file of ownership.files) {
     const target = assertOwnedPath(stagedProject, file.path);
     if (!existsSync(target)) continue;
-    if (!lstatSync(target).isFile() || sha256File(target) !== file.sha256) {
+    if (!lstatSync(target).isFile() || !recordedDigestMatches(target, file.sha256)) {
       throw new Error(
         `cannot prune ${key}: owned path changed since composition: ${file.path}. To keep your ` +
           `change, move that file somewhere else, then run \`${aidlcInvocation()} engine plugin sync ` +
@@ -1245,7 +1261,7 @@ function replaceOwnedPluginPrimitives(
     const target = assertOwnedPath(stagedProject, file.path);
     ownedPaths.add(file.path);
     if (!existsSync(target)) continue;
-    if (!lstatSync(target).isFile() || sha256File(target) !== file.sha256) {
+    if (!lstatSync(target).isFile() || !recordedDigestMatches(target, file.sha256)) {
       throw new Error(
         `cannot sync ${key}: owned path changed since composition: ${file.path}. To keep your ` +
           `change, move that file somewhere else, then run \`${aidlcInvocation()} engine plugin sync\` ` +
