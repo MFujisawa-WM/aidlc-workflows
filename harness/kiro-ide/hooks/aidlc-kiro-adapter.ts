@@ -175,10 +175,10 @@ import {
   resolveTestingPosture,
 } from "../tools/aidlc-testing-posture.ts";
 import { normalizeRetiredGuardPolicyField } from "../tools/aidlc-guard-switch.ts";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { aidlcEngineCommand, aidlcInvocation } from "../tools/aidlc-runtime-paths.ts";
 import { terminalDispatcherArgv } from "../tools/aidlc.ts";
-import { noteKiroIdeTurn } from "../tools/aidlc-rules-held.ts";
+import { kiroIdeTurnOpen, noteKiroIdeTurn } from "../tools/aidlc-rules-held.ts";
 import {
   canonicalWriteTool,
   isAuditedWriteTool,
@@ -1733,6 +1733,45 @@ function toolTerminalInvocation(command: string): TerminalInvocation | null {
   return { raw, args: splitKiroCommandArgs(raw) };
 }
 
+// Whether `latch` is this chat's terminal command of its recorded turn, read
+// before that turn is started again, with the chat named by the payload: then
+// no other shell call of the chat runs in that turn.
+function holdsThisTurn(latch: TerminalLatch | null, recordedTurn: number): latch is TerminalLatch {
+  return latch !== null && recordedTurn > 0 && latch.turn === recordedTurn && (ide.sessionId?.trim() ?? "") !== "";
+}
+
+// Who sent this UserPromptSubmit (kiroTurnOrigin), one reading for every hook
+// that the person's message runs.
+function messageOrigin(): ReturnType<typeof kiroTurnOrigin> {
+  return kiroTurnOrigin({
+    sessionId: ide.sessionId?.trim(),
+    chatSessionId: process.env.KIRO_SESSION_ID,
+    prompt: ide.userPrompt ?? "",
+    templates: KIRO_WORKFLOW_HOST_TEMPLATES,
+  });
+}
+
+// Whether a shell call is one the terminal-command refusal answers with the
+// command's output: the terminal command typed again, a lowering setter, or a
+// call naming a tool file.
+function getsTerminalRefusal(
+  invocation: TerminalInvocation | null,
+  lowering: ReturnType<typeof loweringGuardInvocation>,
+  rawCommand: string,
+): boolean {
+  return invocation !== null || Boolean(lowering) ||
+    /aidlc-(?:orchestrate|utility|knowledge)\.ts/i.test(rawCommand);
+}
+
+// The one same-turn shell check: refuses the call when this chat's terminal
+// command holds the turn, handing the output over again to a call the
+// terminal-command refusal answers.
+function refusesShellThisTurn(latch: TerminalLatch | null, recordedTurn: number, getsOutput: boolean): boolean {
+  if (!holdsThisTurn(latch, recordedTurn)) return false;
+  process.stderr.write(getsOutput ? terminalRefusal(latch) : sameTurnShellRefusal());
+  return true;
+}
+
 function terminalTyped(
   command: TerminalCommand,
   forwarded: string[],
@@ -1839,24 +1878,54 @@ function markSessionStarted(sessionId: string): void {
   }
 }
 
+// A turn number a count can hold and still move on from.
+function usableTurn(turn: unknown): turn is number {
+  return typeof turn === "number" && Number.isSafeInteger(turn) && turn > 0 && turn < Number.MAX_SAFE_INTEGER - 1;
+}
+
+// The chat's recorded turn, or 0 when the count is missing or is not a usable
+// whole number (a count with anything after its digits is not one).
 function readTurn(sessionId: string): number {
   try {
-    const value = Number.parseInt(
-      readFileSync(turnCounterPath(sessionId), "utf-8").trim(),
-      10,
-    );
-    return Number.isFinite(value) && value >= 0 ? value : 0;
+    const text = readFileSync(turnCounterPath(sessionId), "utf-8").trim();
+    const turn = /^\d+$/.test(text) ? Number.parseInt(text, 10) : 0;
+    return usableTurn(turn) ? turn : 0;
   } catch {
     return 0;
   }
 }
 
+// Ends this chat's terminal hold: its latch is removed. False when it stays.
+function endTerminalHold(sessionId: string): boolean {
+  try {
+    rmSync(terminalLatchPath(sessionId), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The one place a turn count starts or moves on. Starting it again (the count
+// was missing or unreadable) also drops the latch left beside it: a latch from
+// before the count was lost cannot be shown to be this turn's. A latch that
+// cannot be removed stays behind the new count, which starts past its turn. A
+// count that cannot be written takes the latch with it, so the previous turn's
+// latch does not match the turns after it.
 function bumpTurn(sessionId: string): number {
-  const turn = readTurn(sessionId) + 1;
+  const recorded = readTurn(sessionId);
+  let start = recorded;
+  if (recorded === 0 && !endTerminalHold(sessionId)) {
+    const latchTurn = readTerminalLatch(sessionId)?.turn;
+    start = usableTurn(latchTurn) ? latchTurn : 0;
+  }
+  const turn = start + 1;
   try {
     mkdirSync(terminalSessionDir(sessionId), { recursive: true });
     writeFileSync(turnCounterPath(sessionId), `${turn}\n`, "utf-8");
   } catch {
+    // When the latch cannot go either, both files are held: nothing here can
+    // move the turn on.
+    endTerminalHold(sessionId);
     return 0;
   }
   return turn;
@@ -2028,7 +2097,7 @@ function terminalContext(result: TerminalResult): string {
     "SYSTEM (deterministic harness dispatch): The command " +
     `\`/aidlc ${result.typed}\` has ALREADY been run by the harness. ` +
     `It carries no workflow work. Relay the output below ${relayAsTextBlock(result.output)}, then STOP. ` +
-    "Do not call any AIDLC tool this turn.\n\n" +
+    "Do not run any shell command or call any AIDLC tool this turn.\n\n" +
     fenceCommandOutput(result.output, result.exitCode)
   );
 }
@@ -2038,9 +2107,29 @@ function terminalRefusal(result: TerminalResult): string {
     "AIDLC deterministic terminal command complete. The requested command has " +
     "already run inside the hook, and this shell call is intentionally refused " +
     "to keep Kiro's Windows shell transport from changing its UTF-8 output. " +
-    "Do not retry or run another AIDLC command this turn. Relay the output below " +
+    "Do not retry or run another shell command this turn. Relay the output below " +
     `to the user ${relayAsTextBlock(result.output)}, then stop.\n\n` +
     fenceCommandOutput(result.output, result.exitCode)
+  );
+}
+
+// Why a lowering setter is refused on a build that does not provide the
+// person's message, with the way out.
+function loweringRefusal(refused: NonNullable<ReturnType<typeof loweringGuardInvocation>>): string {
+  return refused === "summary"
+    ? `Summary confirmation cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${summaryConfirmationWayOut()}\n`
+    : refused === "plan"
+    ? `Plan approval cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${planApprovalWayOut()}\n`
+    : "Guard settings cannot be lowered for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. Update Kiro IDE or start a new piece of work from a scope whose default already uses the lower setting. You can still select strict or turn a fence on.\n";
+}
+
+// The terminal command's output already went to the agent to relay, so this
+// names the step and does not hand it over a second time. It quotes nothing
+// the command carried: its arguments can hold text from the repository.
+function sameTurnShellRefusal(): string {
+  return (
+    "AIDLC already ran this turn's terminal command and gave you its output to show the person, " +
+    "so no other shell command runs this turn. Relay that output and end the turn.\n"
   );
 }
 
@@ -2147,6 +2236,17 @@ if (target === CATCH_UP) {
 if (target === "verb-intercept") {
   // Before a doctor request below runs, so it sees this message.
   recordPreWorkflowHeartbeat(projectDir, "terminal-command");
+  // A prompt Kiro made is no turn of the person's (record-human-turn) and no
+  // terminal command, and it moves no turn on: the turn count counts the
+  // person's messages. It starts a run of its own, such as a finished workflow
+  // the person launched, so once the run the terminal command held has ended
+  // (its Stop closed the chat's turn), the hold ends too. While that run is
+  // still open, or for another chat's session, the hold stays.
+  if (messageOrigin().kind === "host") {
+    const chat = ide.sessionId?.trim() ?? "";
+    if (chat !== "" && !kiroIdeTurnOpen(projectDir, chat)) endTerminalHold(terminalSessionId());
+    return 0;
+  }
   const sessionId = terminalSessionId();
   const turn = bumpTurn(sessionId);
   recordPromptEmpty(sessionId, turn);
@@ -2162,14 +2262,49 @@ if (target === "verb-intercept") {
 }
 
 if (target === "terminal-command-guard") {
-  if ((ide.malformedFields?.length ?? 0) > 0) return 0;
   const tool = ide.toolName ?? "";
+  if ((ide.malformedFields?.length ?? 0) > 0) {
+    // A shell call whose tool input cannot be read still runs nothing in a
+    // turn the chat's terminal command holds; nothing else here reads it.
+    if (isKiroShellTool(tool) && (ide.sessionId?.trim() ?? "") !== "") {
+      const sessionId = terminalSessionId();
+      if (refusesShellThisTurn(readTerminalLatch(sessionId), readTurn(sessionId), false)) return 2;
+    }
+    return 0;
+  }
   if (!isKiroShellTool(tool)) {
     return 0;
   }
   const rawCommand = typeof ide.toolArgs?.command === "string"
     ? ide.toolArgs.command
     : "";
+  const invocation = toolTerminalInvocation(rawCommand);
+  const lowering = loweringGuardInvocation(rawCommand);
+  const sessionId = terminalSessionId();
+  // Only a recorded turn can say a latch is this turn's (bumpTurn drops the
+  // latch when it has to start the count again).
+  const recordedTurn = readTurn(sessionId);
+  // Any other shell call in the turn the chat's terminal command ran in: the
+  // agent was told to relay the output and stop (terminalContext), and a call
+  // there can hand out the next stage on a turn that asked only for a terminal
+  // command, through the dispatcher, the native `aidlc`, or a name the shell
+  // builds at run time. No reading of the command decides which call is
+  // harmless, so none runs, and this comes before the checks below that would
+  // ask for a fixed call. The terminal command typed again gets the refusal
+  // that hands its output over once more; a lowering setter on a build that
+  // hides the message keeps its own refusal, which names the way out. Only the
+  // chat the payload names is
+  // judged; with no session in it, this stays out. (The engine's own guard for
+  // this, Branch 0, reads only the agent-v1 project-wide latch; the engine
+  // could tell this chat's latch from another's only by process ancestry,
+  // which one IDE window shares.)
+  const refused = invocation !== null ? loweringGuardFlags(invocation.args, false) : lowering;
+  const held = readTerminalLatch(sessionId);
+  if (holdsThisTurn(held, recordedTurn) && refused !== null && promptWasEmpty(sessionId, recordedTurn)) {
+    process.stderr.write(loweringRefusal(refused));
+    return 2;
+  }
+  if (refusesShellThisTurn(held, recordedTurn, getsTerminalRefusal(invocation, lowering, rawCommand))) return 2;
   // A lone carriage return, on any shell and any agent (a delegated call
   // carries no agent identity, and this reads none). The agents' rules cannot
   // name one (delegate-shell-deny.ts RISKY_SHELL_FORMS); a carriage return
@@ -2203,28 +2338,14 @@ if (target === "terminal-command-guard") {
     process.stderr.write(aidlcCodeArgumentRefusal(codeHazard));
     return 2;
   }
-  const invocation = toolTerminalInvocation(rawCommand);
-  const lowering = loweringGuardInvocation(rawCommand);
-  const sessionId = terminalSessionId();
-  const turn = readTurn(sessionId) || bumpTurn(sessionId);
-  const refused = invocation !== null ? loweringGuardFlags(invocation.args, false) : lowering;
+  const turn = recordedTurn || bumpTurn(sessionId);
   if (promptWasEmpty(sessionId, turn) && refused !== null) {
-    process.stderr.write(refused === "summary"
-      ? `Summary confirmation cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${summaryConfirmationWayOut()}\n`
-      : refused === "plan"
-      ? `Plan approval cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${planApprovalWayOut()}\n`
-      : "Guard settings cannot be lowered for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. Update Kiro IDE or start a new piece of work from a scope whose default already uses the lower setting. You can still select strict or turn a fence on.\n");
+    process.stderr.write(loweringRefusal(refused));
     return 2;
   }
-  const existing = readTerminalLatch(sessionId);
-  if (
-    existing?.turn === turn &&
-    (
-      invocation !== null ||
-      lowering ||
-      /aidlc-(?:orchestrate|utility|knowledge)\.ts/i.test(rawCommand)
-    )
-  ) {
+  // A count started again above leaves no latch that matches it.
+  const existing = recordedTurn > 0 ? held : null;
+  if (existing?.turn === turn && getsTerminalRefusal(invocation, lowering, rawCommand)) {
     process.stderr.write(terminalRefusal(existing));
     return 2;
   }
@@ -2624,12 +2745,7 @@ function buildForward(): Forward {
       // remembered as the chat, opens no turn, and the core hook records it as
       // HOST_TURN with nothing of the person's on it. Anything unknown is the
       // person's.
-      const origin = kiroTurnOrigin({
-        sessionId: eventSessionId,
-        chatSessionId: process.env.KIRO_SESSION_ID,
-        prompt: ide.userPrompt ?? "",
-        templates: KIRO_WORKFLOW_HOST_TEMPLATES,
-      });
+      const origin = messageOrigin();
       if (origin.kind === "host") {
         return {
           hook: "aidlc-record-human-turn.ts",

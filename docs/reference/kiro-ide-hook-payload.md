@@ -78,7 +78,7 @@ Result prose is identical on both channels (`toolResult` on 0.12,
 | PostToolUse (shell) | `execute_bash` | `{}` (empty) | `Output:\n<stdout>\n\nExit Code: 0` | command: **not** recoverable (only stdout) |
 
 When UserPromptSubmit carries a typed fence or Guard Policy switch, the adapter forwards it to the core human-turn hook, which applies it at prompt time under the payload session and returns an `AIDLC Guard Policy:` note; shell setters are not run inside the adapter.
-A prompt Kiro made is not the person's turn: a message Kiro's own chat record (`~/.kiro/sessions/<workspace>/<session>/messages.jsonl`, the payload's session) marks with `_meta.kiro.syntheticUserMessageReason`, or one of the two workflow sentences whole and anchored (a Workflows step's brief opens with one), is forwarded with `origin: {kind: "host"}`: the core hook records `HOST_TURN` and nothing of the person's, and the adapter starts no session, remembers no chat and opens no turn for it. A message the record tags `_meta.kiro.userMessageTag` is the person's whatever its words, and so is anything unknown, including a payload `session_id` other than the chat's `KIRO_SESSION_ID` on its own (that variable named the chat even for a step's prompt, so it may not name the tab a message came from).
+A prompt Kiro made is not the person's turn: a message Kiro's own chat record (`~/.kiro/sessions/<workspace>/<session>/messages.jsonl`, the payload's session) marks with `_meta.kiro.syntheticUserMessageReason`, or one of the two workflow sentences whole and anchored (a Workflows step's brief opens with one), is forwarded with `origin: {kind: "host"}`: the core hook records `HOST_TURN` and nothing of the person's, and the adapter starts no session, remembers no chat and opens no turn for it; once the chat's turn has closed, it ends a terminal command's same-turn hold (see below). A message the record tags `_meta.kiro.userMessageTag` is the person's whatever its words, and so is anything unknown, including a payload `session_id` other than the chat's `KIRO_SESSION_ID` on its own (that variable named the chat even for a step's prompt, so it may not name the tab a message came from).
 On empty-prompt builds such as IDE 1.0.242, the per-turn `prompt-empty` marker makes the adapter refuse lowering shell commands (exit 2 with stderr), including environment-prefixed invocations and summary confirmation `off`, and `verb-intercept` emits a once-per-session capability note explaining that active work cannot be lowered on that build and directing the person to update to a prompt-capable IDE or start new work from a lower-default scope; for summary confirmation and for plan approval both also name the person's project-wide terminal command `<invoke> config flags --bypass AIDLC_DISABLE_SUMMARY_CONFIRMATION --local --yes` or `--bypass AIDLC_DISABLE_PLAN_APPROVAL_GUARD` (`--clear-bypass` undoes it), which also works while the work runs. Raising to `strict` or turning a fence or summary confirmation `on` remains available.
 Before forwarding an empty prompt, the adapter renames a sole retired
 `Change Control: relaxed|off` line to `Guard Policy` automatically without
@@ -351,6 +351,47 @@ cards doing the work, and the guard notes nothing for them.
   session identity use the host-derived identity or the retained session, with
   an explicit legacy bucket when neither is available. The 0.12 camelCase
   fallback reads the command from `toolArgs.command`.
+- **A shell call after a terminal command**: in the same turn, the fallback
+  above also refuses a terminal command typed again through the shell, a
+  lowering guard setting, and a call naming the tool files `aidlc-orchestrate.ts`,
+  `aidlc-utility.ts` or `aidlc-knowledge.ts`. Once a terminal command has run for a
+  chat's turn, the agent is told to relay its output and stop, and
+  `terminal-command-guard` also refuses that chat's every other shell call in
+  that turn, also one whose tool input cannot be read, with exit 2 and one fixed
+  line on stderr that says to relay the output and end the turn and quotes
+  nothing the command carried. For a chat the payload names, this is decided
+  before the refusals that ask for a fixed call (a lone carriage return, an AI-DLC
+  reply sent to a file, a value cmd.exe would split, PowerShell code in an
+  argument), so the agent is not told
+  to run the call again: the terminal command typed again, or a call naming a
+  tool file, or a lowering setter, gets the fallback's refusal with its output
+  instead, also when it carries such a character; on a build that hides the
+  person's message a lowering setter gets its own refusal, which names the way
+  out. It covers the dispatcher or the native `aidlc` with any
+  arguments, for any project, a name the shell builds at run time, and a call
+  that names no AIDLC at all. No reading of the command decides which call is
+  harmless. Tools that are not a shell are not this check's. A turn moves on only with the
+  person's message (`UserPromptSubmit`; a prompt Kiro made itself, recorded as
+  `HOST_TURN`, moves no turn on, but once the run the terminal command held has
+  ended with its Stop, such a prompt for the chat starts a run of its own and
+  ends the hold; while that run is open, or for a workflow step's own session,
+  the hold stays): an agent run Kiro starts without one
+  keeps the turn, and the person's next message releases it. The same-turn
+  shell check judges only the chat the payload's `session_id` names, against a
+  turn that chat has recorded: with no session in the payload, another chat's
+  latch, or a later turn it refuses nothing. The turn count is read only as a
+  whole number, and whenever it has to start again (missing or unreadable) the
+  latch beside it is dropped; when the latch cannot be removed, the new count
+  starts past its turn. A count that cannot be written takes the latch with
+  it, so that turn's terminal command leaves no latch and its shell calls run.
+  Only when the count cannot be written and the latch cannot be removed does
+  the latch keep matching, until one of them can be changed again or the
+  person opens a new chat. The terminal-command refusal still follows the
+  host's or the retained session when a payload names none. The engine's own
+  guard for this (Branch 0) reads only the agent-v1 project-wide latch, not
+  these per-chat ones: the engine could tell one chat's latch from another's
+  only through process ancestry, and the chats of one Kiro IDE window share a
+  process.
 - **cmd.exe metacharacters**: native Windows `aidlc` is `aidlc.cmd`, so cmd.exe
   reads the command line Windows PowerShell 5.1 builds for it: a value holding
   a space is wrapped in double quotes with its own double quotes left as they

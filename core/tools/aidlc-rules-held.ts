@@ -333,6 +333,26 @@ function hostRunsThisChat(harness: string, sessionId: string): boolean {
 /**
  * Kiro IDE: a prompt opens its chat's turn, and the turn's Stop closes it.
  */
+// Whether a turn-open marker still counts: it holds a readable time, not later
+// than now and no older than OPEN_TURN_MAX_MS. One that cannot be read, holds
+// no time, lies ahead of the clock (the clock went back) or is older is a
+// closed turn.
+function openTurnMarkerCounts(path: string, now: number): boolean {
+  let at = NaN;
+  try {
+    at = Date.parse(readFileSync(path, "utf-8").trim());
+  } catch {
+    // A marker that cannot be read counts as an old one.
+  }
+  return Number.isFinite(at) && at <= now && now - at <= OPEN_TURN_MAX_MS;
+}
+
+/** Whether a Kiro IDE chat has a turn open: the person's message opened it, no Stop has closed it, and it is not stale. */
+export function kiroIdeTurnOpen(projectDir: string, sessionId: string | undefined): boolean {
+  const sid = validSessionId(sessionId);
+  return sid !== null && openTurnMarkerCounts(turnOpenPath(projectDir, sid), Date.now());
+}
+
 export function noteKiroIdeTurn(projectDir: string, sessionId: string | undefined, open: boolean): void {
   const sid = validSessionId(sessionId);
   if (sid === null) return;
@@ -356,13 +376,7 @@ function openTurnsHold(projectDir: string, sid: string, space: string, steering:
   for (const name of readdirSync(sessionsDir(projectDir))) {
     if (!name.endsWith(".turn-open")) continue;
     const other = name.slice(0, -".turn-open".length);
-    let at = NaN;
-    try {
-      at = Date.parse(readFileSync(join(sessionsDir(projectDir), name), "utf-8").trim());
-    } catch {
-      // A marker that cannot be read is skipped like an old one.
-    }
-    if (!Number.isFinite(at) || now - at > OPEN_TURN_MAX_MS) continue;
+    if (!openTurnMarkerCounts(join(sessionsDir(projectDir), name), now)) continue;
     if (other === sid) {
       own = true;
       continue;
