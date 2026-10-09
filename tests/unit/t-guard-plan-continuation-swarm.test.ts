@@ -20,7 +20,7 @@ import {
   workspaceSourceListing, worktreePath, writeActiveDirectiveMarker, writeBaselineSourceSnapshot,
 } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
 import {
-  approvalFingerprint, codeGenerationExecutionAllowed, codeGenerationRecordDir,
+  approvalFingerprint, codeGenerationExecutionAllowed, codeGenerationPlanApprovalQuestionEvidence, codeGenerationRecordDir,
   evaluateCodeGenerationApproval, parseTestingContract, renderTestingContract,
   resolveCodeGenerationAuthority, resolveTestingPosture, resolveTestingPostureFromSections,
 } from "../../dist/claude/.claude/tools/aidlc-testing-posture.ts";
@@ -1049,5 +1049,43 @@ describe("a parallel batch's writes judged from the parent", () => {
     const raised = write(pd, source);
     expect(raised.code).toBe(2);
     expect(raised.err).toContain(REFUSAL);
+  });
+});
+
+// The engine's own recorder writes the person's choice with its option letter
+// ("[Answer]: A. Approve Plan"); a hand-recorded answer carries the bare label.
+// Both are the same answer to every reader, prepare's source preflight included.
+describe("prepare reads the answer the engine recorded", () => {
+  test("the lettered Approve Plan line forks the worker like the bare label does", () => {
+    const pd = fixture();
+    const questions = join(codeGenerationRecordDir(pd, UNIT), "code-generation-questions.md");
+    const recorded = readFileSync(questions, "utf-8");
+    expect(recorded).toContain("[Answer]: Approve Plan");
+    // The receipt binds the answer-blanked prompt, so the line's spelling is free to be the recorder's.
+    writeFileSync(questions, recorded.replace("[Answer]: Approve Plan", "[Answer]: A. Approve Plan"));
+    expect(evaluateCodeGenerationApproval(pd, TARGET).ok).toBe(true);
+    const prepared = prepare(pd);
+    expect(prepared.code, `${prepared.out}\n${prepared.err}`).toBe(0);
+    expect(prepared.err).not.toContain("must contain exactly [Answer]");
+    expect(existsSync(join(child(pd), "src", `${UNIT}.ts`))).toBe(true);
+    expect(starts(pd)).toHaveLength(1);
+  });
+
+  test("the reader takes the label however the letter or quotes were written, and still refuses another answer", () => {
+    const pd = fixture();
+    const questions = join(codeGenerationRecordDir(pd, UNIT), "code-generation-questions.md");
+    const recorded = readFileSync(questions, "utf-8");
+    const evidence = (line: string, expected: "Approve Plan" | "Request Changes" = "Approve Plan") => {
+      writeFileSync(questions, recorded.replace("[Answer]: Approve Plan", `[Answer]: ${line}`));
+      return () => codeGenerationPlanApprovalQuestionEvidence(pd, TARGET, questions, expected, { breakGlass: true });
+    };
+    // The shared approval reader is case-insensitive about the letter; this reader agrees with it.
+    for (const line of ["A. Approve Plan", "a. Approve Plan", "A) Approve Plan", "\"Approve Plan\"", "approve plan"]) {
+      expect(evidence(line), line).not.toThrow();
+    }
+    expect(evidence("B. Request Changes", "Request Changes")).not.toThrow();
+    for (const line of ["B. Request Changes", "Approve", ""]) {
+      expect(evidence(line), line).toThrow("Plan Approval questions file must contain exactly [Answer]: Approve Plan");
+    }
   });
 });
