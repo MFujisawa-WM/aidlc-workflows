@@ -310,6 +310,33 @@ describe("what the agent reads", () => {
     );
   });
 
+  // A live run (#2200): after one `Command timed out` the agent kept running
+  // long chains in the same terminal for four hours, read stale output, and
+  // planned to delete AI-DLC's lock files. Measured on Kiro IDE 1.2.4: the
+  // terminal answers the very next short command at once, so that is the step;
+  // no window reload or new chat is named.
+  test("after a timed-out command the next step is one short read-only command, never the same command again; a lock file goes only when doctor names it", () => {
+    const skill = readFileSync(join(REPO_ROOT, "dist", "kiro-ide", ".kiro", "skills", "aidlc", "SKILL.md"), "utf-8");
+    expect(skill).toContain(
+      "**When a command comes back with `Command timed out`**, run one short read-only command next (`bun --version` is one) " +
+        "to see whether the terminal answers. Never run the timed-out command again to find out: its outcome is unknown, " +
+        "so check the state it was meant to change, or tell the person in one line. The exception is AI-DLC's own `next`, " +
+        "which changes nothing: run it again.",
+    );
+    // The rerun is not offered, not even for a command that should be quick: a
+    // migration or a deploy may already have happened. AI-DLC's own `next`
+    // changes nothing, so it is the one command run again.
+    const paragraph = skill.split("\n").find((line) => line.startsWith("**When a command comes back with `Command timed out`**")) ?? "";
+    expect(paragraph).not.toMatch(/same command again|again and again|should finish in seconds/);
+    expect(paragraph).toContain("The exception is AI-DLC's own `next`, which changes nothing: run it again.");
+    expect(skill).toContain(
+      "Do not delete AI-DLC's lock files (`.aidlc-audit-*.lock*` in the temp folder) to fix a timeout: " +
+        "they do not slow a command down. Remove one only when `/aidlc --doctor` names it.",
+    );
+    expect(skill).not.toContain("never delete AI-DLC's lock files");
+    expect(skill).not.toMatch(/Command timed out[^\n]*Reload Window/);
+  });
+
   test("both Kiro agent prompts say never to send an AI-DLC command's reply to a file", () => {
     const ide = readFileSync(join(REPO_ROOT, "dist", "kiro-ide", ".kiro", "agents", "aidlc.md"), "utf-8");
     const cli = (JSON.parse(readFileSync(join(REPO_ROOT, "dist", "kiro", ".kiro", "agents", "aidlc.json"), "utf-8")) as { prompt: string }).prompt;
