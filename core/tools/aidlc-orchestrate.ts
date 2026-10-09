@@ -493,6 +493,7 @@ import {
 import {
   type GuardPreflightAction,
   type GuardPreflightResult,
+  failedCheckNotices,
   guardPreflight as stateGuardPreflight,
   parkWorkflow,
 } from "./aidlc-state.ts";
@@ -9111,7 +9112,11 @@ function applyGateOnlyShape(
     const scope = getField(stateContent, "Scope")?.trim() ?? "";
     const unitFolders = isPerUnit(gateNode) && !usesStageLevelPerUnitArtifacts(scope, stateContent);
     const line = producedLine(gateNode, directive.unit ?? null, unitFolders, projectDir);
-    if (line) directive.narration = line;
+    // A check that still fails on a declared output is said with the gate, on
+    // its own line after what the stage produced: the narration is the
+    // person's line, and the produced sentence stays whole.
+    const narration = [line, failedCheckNotices(projectDir, gateNode, directive.unit ?? null).join(" ")].filter(Boolean).join("\n");
+    if (narration) directive.narration = narration;
   }
   directive.protocol_modules = (directive.protocol_modules ?? []).filter(
     (module) =>
@@ -14814,25 +14819,27 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         emit(withChangeNotices(parked, changeNotices));
         return;
       }
-      emit(
-        withChangeNotices(
-          flags.result === "approved"
-            ? {
-                kind: "done",
-                reason:
-                  `Committed ${committed.join(" + ")} for unit "${unit}" of "${slug}". ` +
-                  "Run next to continue the unit-major walk.",
-                ...workflowContinues(pd),
-              }
-            : printDirective(
-                completionOpensGate
-                  ? completionOpensGateMessage(`Unit "${unit}" of "${slug}"`)
-                  : `Recorded ${flags.result} for unit "${unit}" of "${slug}".` +
-                    personsFeedbackSentence(personsFeedback),
-              ),
-          changeNotices,
-        ),
-      );
+      const unitReply = flags.result === "approved"
+        ? {
+            kind: "done" as const,
+            reason:
+              `Committed ${committed.join(" + ")} for unit "${unit}" of "${slug}". ` +
+              "Run next to continue the unit-major walk.",
+            ...workflowContinues(pd),
+          }
+        : printDirective(
+            completionOpensGate
+              ? completionOpensGateMessage(`Unit "${unit}" of "${slug}"`)
+              : `Recorded ${flags.result} for unit "${unit}" of "${slug}".` +
+                personsFeedbackSentence(personsFeedback),
+          );
+      // A check that still fails on a declared output is said with the gate,
+      // as the person's line beside the question, never as a change line.
+      if (unitReply.kind === "print" && (flags.result === "awaiting-approval" || flags.result === "revised")) {
+        const checks = failedCheckNotices(pd, node, unit);
+        if (checks.length > 0) unitReply.narration = checks.join(" ");
+      }
+      emit(withChangeNotices(unitReply, changeNotices));
       return;
     }
     if (flags.unit) {
@@ -15077,7 +15084,12 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         const gateState = loadStateFileIfPresent(pd);
         const unitFolders = isPerUnit(node) && !usesStageLevelPerUnitArtifacts(scope, gateState);
         const line = producedLine(node, unit, unitFolders, pd);
-        if (line) gateReply.narration = line;
+        // A check that still fails on a declared output is said with the gate,
+        // on its own line after what the stage produced: the narration is the
+        // person's line (the produced sentence stays whole), and the change
+        // lines stay what changed.
+        const narration = [line, failedCheckNotices(pd, node, unit).join(" ")].filter(Boolean).join("\n");
+        if (narration) gateReply.narration = narration;
       }
     }
     emit(gateReply);
