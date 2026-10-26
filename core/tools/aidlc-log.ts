@@ -16,8 +16,10 @@ import { appendAuditEntry, appendAuditEntryUnlocked } from "./aidlc-audit.ts";
 import { prepareReviewCopy, removeReviewCopy } from "./aidlc-kiro-review-copy.ts";
 import {
   chatsSince,
+  latestMessage,
   latestSpendingTimestamp,
   listMessages,
+  messageBeforeJoining,
   proveMessage,
   readMessage,
   type StoredMessage,
@@ -1077,6 +1079,21 @@ function decisionRowsInScope(rows: AuditShardEvent[], stage: string, unit: strin
 function latestDecisionMessageId(pd: string, stage: string, unit: string | undefined): string | null {
   const question = decisionRowsInScope(readAuditShardEvents(pd), stage, unit).at(-1);
   return question === undefined ? null : auditBlockField(question.block, "Message Id");
+}
+
+// With no reply on record, the refusal names this chat's latest message when it
+// came before the chat was on this work (a teammate's clone, the message that
+// picked the work up: messageBeforeJoining), by id and time, so the agent
+// records the answer on it if it holds one. Only the latest: an earlier one may
+// be a reply the chat gave on other work. Null when it is not such a message.
+function keptMessageRefusal(pd: string): string | null {
+  const chat = invokingChat(pd);
+  const latest = chat === null ? null : latestMessage(pd, chat);
+  if (latest === null || messageBeforeJoining(pd, latest.id) === null) return null;
+  const missed = unattendedHumanPresenceHint(pd);
+  return `Cannot record this answer: the person's message ${latest.id} (sent ${latest.at}) came before this chat ` +
+    "was on this work, so it is on record as no reply. If it answers the question, run the same command with " +
+    `--message ${latest.id}; do not ask them again.` + (missed === "" ? "" : ` If no message of theirs answers it:${missed}`);
 }
 
 function handleDecision(args: string[]): void {
@@ -2686,7 +2703,8 @@ function handleAnswer(args: string[]): void {
       // One reply answers every question the agent asked, each as its own
       // answer: an answer spends no reply.
       error(
-        "Cannot record this answer because no new human reply has arrived for the question. "
+        keptMessageRefusal(pd) ??
+          "Cannot record this answer because no new human reply has arrived for the question. "
           + "Wait for the human to type an answer, then try again."
           + commandTurnHint(pd)
           + unattendedHumanPresenceHint(pd),
