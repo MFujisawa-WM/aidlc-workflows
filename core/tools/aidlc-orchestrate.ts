@@ -459,6 +459,9 @@ import {
   swarmWorkerWorktreeMeta,
   scopeCostSummary,
   singleStageAttemptField,
+  keepSingleRunRequest,
+  SINGLE_RUN_REQUEST_FIELD,
+  singleRunRequestDigest,
   singleStageAttemptIsOpen,
   singleStageAttemptScope,
   defaultScope,
@@ -622,7 +625,14 @@ import {
   runtimeHarnessName,
 } from "./aidlc-runtime-paths.ts";
 import { terminalDispatcherArgv } from "./aidlc.ts";
-import { appendAuditEntries, appendAuditEntry, type AuditEntryInput, SESSION_EVENT_TYPES } from "./aidlc-audit.ts";
+import {
+  appendAuditEntries,
+  appendAuditEntry,
+  type AuditEntryInput,
+  maskSecretShapes,
+  saySecretMaskedOnce,
+  SESSION_EVENT_TYPES,
+} from "./aidlc-audit.ts";
 import { inspectRequiredArtifactInstances } from "./aidlc-artifact-resolution.ts";
 import { renderEngineInvocation, sameGuardOperation } from "./aidlc-guard-operation.ts";
 import {
@@ -11458,6 +11468,7 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
         Depth: flags.depth ? VALID_DEPTHS[flags.depth] : undefined,
         "Test Strategy": flags.testStrategy ? VALID_TEST_STRATEGIES[flags.testStrategy] : undefined,
       },
+      flags.intent !== undefined && flags.intent.trim() !== "" ? flags.intent : null,
     );
     return;
   }
@@ -16273,9 +16284,14 @@ function ensureSingleStageStarted(
   scope: string,
   typed: SingleRunSettings,
   record: { prefix: string | null; codekbCtx: CodekbCtx },
-): { error: string } | { settings: SingleRunSettings; restarted: boolean; kept: KeptCopy | null } {
+  request: string | null,
+): { error: string } | { settings: SingleRunSettings; restarted: false | "settings" | "request"; kept: KeptCopy | null } {
   let settings = typed;
-  let restarted = false;
+  let restarted: false | "settings" | "request" = false;
+  // The committed record keeps key shapes masked (SECRET_SHAPES), as a piece of
+  // work's project-description.json does; the whole message stays in the
+  // git-ignored message record.
+  const words = request === null ? null : maskSecretShapes(request);
   let kept: KeptCopy | null = null;
   if (singleStageAttemptIsOpen(projectDir, node.slug)) {
     const recordedScope = singleStageAttemptScope(projectDir, node.slug);
@@ -16293,7 +16309,12 @@ function ensureSingleStageStarted(
     kept = keptPath === null || keptPath === SINGLE_RUN_NOTHING_KEPT ? null : { path: keptPath };
     const changed = SINGLE_RUN_SETTING_FIELDS
       .some((field) => typed[field] !== undefined && typed[field] !== recorded[field]);
-    if (!changed) {
+    // With no work, other words than the ones its start kept are a new request:
+    // the run starts over with them, as it does with a setting typed differently.
+    const keptRequest = singleStageAttemptField(projectDir, node.slug, SINGLE_RUN_REQUEST_FIELD);
+    const newRequest = words !== null && keptRequest !== null && loadStateFileIfPresent(projectDir) === null &&
+      singleRunRequestDigest(words) !== keptRequest;
+    if (!changed && !newRequest) {
       // A start with no Kept Copy keeps its copy now, so an attempt opened
       // before an upgrade does not write over the work's files with no way
       // back. The attempt and its receipts go on: nothing is appended.
@@ -16306,12 +16327,24 @@ function ensureSingleStageStarted(
     // A new STAGE_STARTED is the new attempt's floor: the unfinished one's
     // receipts stop counting, and nothing records it as completed.
     settings = { ...recorded, ...Object.fromEntries(Object.entries(typed).filter(([, value]) => value !== undefined)) };
-    restarted = true;
+    restarted = changed ? "settings" : "request";
   }
   // A query never appends a lifecycle event or copies a file: an observer that
   // opened a single-stage attempt would move the run floor it came to read.
   if (isReadOnlyEngineProbe()) return { settings, restarted, kept };
   kept ??= keepStageFiles(projectDir, node, scope, record.prefix, record.codekbCtx);
+  // With no work there is no work's description to read: the words typed with
+  // this start are the run's own (singleRunRequest). A copy that cannot be
+  // kept leaves the run with none, and the agent asks.
+  let requestDigest: string | null = null;
+  if (words !== null && loadStateFileIfPresent(projectDir) === null) {
+    try {
+      requestDigest = keepSingleRunRequest(projectDir, node.slug, words);
+      if (words !== request) saySecretMaskedOnce(projectDir);
+    } catch {
+      requestDigest = null;
+    }
+  }
   const error = appendSingleStageAuditEvents(projectDir, [{
     eventType: "STAGE_STARTED",
     fields: {
@@ -16323,6 +16356,7 @@ function ensureSingleStageStarted(
       ...(kept === null
         ? { [SINGLE_RUN_KEPT_FIELD]: SINGLE_RUN_NOTHING_KEPT }
         : "path" in kept ? { [SINGLE_RUN_KEPT_FIELD]: kept.path } : {}),
+      ...(requestDigest === null ? {} : { [SINGLE_RUN_REQUEST_FIELD]: requestDigest }),
     },
   }]);
   routingEvidence = null;
@@ -16337,6 +16371,7 @@ function emitSingleRunStage(
   codekbCtx: CodekbCtx,
   projectDir: string,
   settings: SingleRunSettings = {},
+  request: string | null = null,
 ): void {
   const node = nodeForSlug(slug);
   if (!node) {
@@ -16352,7 +16387,7 @@ function emitSingleRunStage(
   // An isolated run never touches the plan or the cursor, so a stage the
   // scope skips runs too when the person asks for it, with one line saying so.
   const notInPlan = !new Set(subgraphForScope(scope).map((s) => s.slug)).has(node.slug);
-  const started = ensureSingleStageStarted(projectDir, node, scope, settings, { prefix: recordPrefix, codekbCtx });
+  const started = ensureSingleStageStarted(projectDir, node, scope, settings, { prefix: recordPrefix, codekbCtx }, request);
   if ("error" in started) {
     emit(errorDirective(
       `Cannot start isolated stage "${node.slug}": ${started.error}`,
@@ -16388,9 +16423,10 @@ function emitSingleRunStage(
       ? [`"${node.slug}" is not part of the ${scope} plan. It runs on its own because you asked for it; ` +
         "the plan and your workflow stay as they are."]
       : []),
-    ...(started.restarted
-      ? [`"${node.slug}" starts over with the settings you gave; its unfinished run is set aside, not completed.`]
-      : []),
+    ...(started.restarted === false
+      ? []
+      : [`"${node.slug}" starts over with ${started.restarted === "request" ? "your new request" : "the settings you gave"}; ` +
+        "its unfinished run is set aside, not completed."]),
     ...(started.kept === null ? [] : [keptCopyNotice(node, started.kept)]),
   );
   emit(directive);
