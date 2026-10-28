@@ -8679,7 +8679,7 @@ function handleIntentCreateStateBuild(
   for (const stage of graph) {
     const action = planStages[stage.slug] || "SKIP";
     if (action === "EXECUTE") {
-      executeStages.push(stage.number);
+      executeStages.push(`${stage.number} (${stage.slug})`);
     } else {
       skipStages.push(`${stage.number} (${stage.slug})`);
     }
@@ -8692,7 +8692,7 @@ function handleIntentCreateStateBuild(
       adjustedMapping["reverse-engineering"] = "SKIP";
       const reStage = graph.find((s) => s.slug === "reverse-engineering");
       if (reStage) {
-        const idx = executeStages.indexOf(reStage.number);
+        const idx = executeStages.indexOf(`${reStage.number} (${reStage.slug})`);
         if (idx >= 0) executeStages.splice(idx, 1);
         skipStages.push(`${reStage.number} ${GREENFIELD_RE_SKIP_LABEL}`);
       }
@@ -12189,7 +12189,7 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       for (const stage of graph) {
         const action = adjustedMapping[stage.slug] || "SKIP";
         if (action === "EXECUTE") {
-          executeStages.push(stage.number);
+          executeStages.push(`${stage.number} (${stage.slug})`);
         } else {
           let reason = stage.slug;
           if (stage.slug === "reverse-engineering" && projectType.toLowerCase() === "greenfield" &&
@@ -12474,7 +12474,7 @@ function rebuildEffectivePlanFields(
     }
   }
   for (const s of graph) {
-    if (eff(s.slug) === "EXECUTE") executeStages.push(s.number);
+    if (eff(s.slug) === "EXECUTE") executeStages.push(`${s.number} (${s.slug})`);
     else if (!preservedSlugs.has(s.slug)) skipStages.push(skipLabel(s));
   }
   let next = setField(content, "Stages to Execute", executeStages.join(", "));
