@@ -132,6 +132,7 @@ import {
   recordHookDrop,
   releaseAuditLock,
   resolveBoltDag,
+  runStateContent,
   resolveProjectFlag,
   resolveProjectDirFromHook,
   jumpClaimSha256,
@@ -184,6 +185,7 @@ import {
   WORKER_BRIEF_SECTIONS,
 } from "../tools/aidlc-testing-posture.ts";
 import { refuseRuntimeIntegrityViolation } from "./runtime-integrity.ts";
+import { unaskedSystemInstall } from "./system-install.ts";
 
 export { questionsFileHasPendingPlanApproval } from "../tools/aidlc-testing-posture.ts";
 
@@ -2369,6 +2371,29 @@ async function evaluate(
   // it is written. A path or command the reason quotes stays on the one line.
   // biome-ignore lint/suspicious/noControlCharactersInRegex: replacing them is the point
   const oneLine = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ");
+  // A system package install nobody asked for waits for the person at every
+  // stage and under every Guard Policy: it is not a fence (system-install.ts).
+  // The run's state is the work's, or an isolated run's with no work, which
+  // has no state file and names its stage on its step.
+  if (toolName === "Bash" && typeof toolInput.command === "string") {
+    try {
+      const runState = runStateContent(projectDir);
+      if (runState !== null && !selectedRecordIsFinished(projectDir, workflow.selection)) {
+        const command = oneLine(toolInput.command).trim();
+        const refusal = unaskedSystemInstall(projectDir, toolInput.command, command.length > 160 ? `${command.slice(0, 160)}...` : command, {
+          hook: HOOK_NAME,
+          session: validSessionId(typeof parsed.session_id === "string" ? parsed.session_id : undefined),
+          stage: getField(runState, "Current Stage") ?? readActiveDirectiveMarker(projectDir, runState)?.stage ?? "",
+        });
+        if (refusal !== null) {
+          process.stderr.write(`${refusal}\n`);
+          return 2;
+        }
+      }
+    } catch (error) {
+      recordHookDrop(projectDir, HOOK_NAME, `system install check skipped: ${errorMessage(error)}`);
+    }
+  }
   let blockedMutation: {
     target: string;
     unit: string | null;
