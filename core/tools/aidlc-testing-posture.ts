@@ -1588,6 +1588,48 @@ export function approvalFingerprint(
   return `${APPROVAL_FINGERPRINT_PREFIX}${digest.slice("sha256:".length)}`;
 }
 
+// Whether the plan and instructions are still what the person sent back with a
+// change request: the content the build in `closed` (the run floor of the
+// attempt their rejection closed) started on. In a later attempt than the
+// approval's, that is the revision a lowered fence built there for their
+// previous change request; in the approval's own attempt, the content it
+// started on there, or the approved content. Only that one: a revision that
+// lands back on the plan they first approved is a revision. While it holds,
+// the change they asked for has not been carried out yet.
+export function planAsSentBack(
+  plan: string,
+  instructions: string,
+  contractHash: string,
+  receipt: PlanApprovalRuntimeReceipt,
+  closed: string,
+): boolean {
+  const at = (runFloor: string): string => approvalFingerprint(plan, instructions, contractHash, { ...receipt, runFloor });
+  return closed !== receipt.runFloor && receipt.startedFingerprint !== undefined
+    ? at(closed) === receipt.startedFingerprint
+    : at(receipt.runFloor) === (receipt.startedFingerprint ?? receipt.fingerprint);
+}
+
+// The attempt the person's rejection closed: the stage's run floor as it stood
+// just before their `GATE_REJECTED` row, read the way the attempt's own floor
+// is. Null when the row is not among `rows` or there is no workflow state.
+export function attemptRejectionClosed(
+  projectDir: string,
+  rows: readonly AuditShardEvent[],
+  rejection: AuditShardEvent,
+  unit: string | null,
+): string | null {
+  const state = runStateContent(projectDir);
+  const ordered = sortAttemptEvents(rows);
+  const at = ordered.indexOf(rejection);
+  if (state === null || at < 0) return null;
+  return latestMainWorkflowStageRunFloorForProject(
+    projectDir, CODE_GENERATION_STAGE,
+    getField(state, "Construction Iteration")?.trim() === "unit-major" ||
+      getField(state, "Construction Checkpoints") === "enabled",
+    unit ?? undefined, ordered.slice(0, at),
+  );
+}
+
 // --- The worker brief ------------------------------------------------------------
 //
 // What a code-generation worker is handed is the plan as the approval projection sees it (a terminal
@@ -3150,11 +3192,13 @@ interface CodeGenerationContinuation {
  * person turns it on they get the question they asked for.
  *
  * And only once the plan has actually been revised. While it still reads as the
- * plan they approved, their change request has not been carried out yet, and
- * `next` owes them the `revise` step that hands the agent their words; carrying
- * the approval then would skip it and build the unchanged plan. Ticking a step
- * is not a revision: the fingerprint's projection already leaves task markers
- * out, so the build that their rejection closed does not look like a change.
+ * plan the build their rejection closed started on (the one they approved, or
+ * the revision built for their previous change request), their change request
+ * has not been carried out yet, and `next` owes them the `revise` step that
+ * hands the agent their words; carrying the approval then would skip it and
+ * build the unchanged plan. Ticking a step is not a revision: the fingerprint's
+ * projection already leaves task markers out, so the build that their rejection
+ * closed does not look like a change.
  */
 function approvalFromTheirChangeRequest(
   projectDir: string,
@@ -3163,11 +3207,11 @@ function approvalFromTheirChangeRequest(
 ): PlanApprovalRuntimeReceipt | null {
   const floor = /^GATE_REJECTED:(.+)#\d+$/.exec(authority.runFloor);
   if (floor === null) return null;
-  const rejection = rejectionAtRunFloor(
-    readAuditShardEvents(projectDir), "code-generation", authority.unit ?? undefined, authority.runFloor,
-  );
+  const rows = readAuditShardEvents(projectDir);
+  const rejection = rejectionAtRunFloor(rows, "code-generation", authority.unit ?? undefined, authority.runFloor);
   if (rejection === undefined) return null;
   if (rejectionIsFreshAttempt(rejection.block)) return null;
+  const closed = attemptRejectionClosed(projectDir, rows, rejection, authority.unit);
   const plan = readFileSync(join(authority.stageDir, "code-generation-plan.md"), "utf-8");
   const instructions = readFileSync(join(authority.stageDir, "unit-test-instructions.md"), "utf-8");
   const contract = parseTestingContract(plan);
@@ -3178,9 +3222,8 @@ function approvalFromTheirChangeRequest(
     receipt.choice === "Approve Plan" &&
     receipt.skipped === undefined && receipt.session !== "engine" &&
     runtimeIdentityMatches(receipt, { ...identity, runFloor: receipt.runFloor, promptSha256: receipt.promptSha256 }) &&
-    // Judged against that approval's own attempt, the way the revision route
-    // judges it: equal means the plan is still the one they approved.
-    approvalFingerprint(plan, instructions, contract.contract_sha256, receipt) !== receipt.fingerprint
+    // The same judgement the revision route makes.
+    !planAsSentBack(plan, instructions, contract.contract_sha256, receipt, closed ?? receipt.runFloor)
   ) ?? null;
 }
 
@@ -5775,15 +5818,31 @@ function publishCodeGenerationStart(
   if (continuation) recordContinuedStaleContract(projectDir, continuation);
   const changeNotices: string[] = continuation && options.recordContinuation !== false
     ? recordCodeGenerationContinuation(projectDir, continuation, "begin") : [];
-  if (receipt.status === "generation") return changeNotices;
-  originals.push(receipt);
-  // A lowered fence building a plan edited after its approval: the receipt
-  // keeps the content the build started on, so an interrupted build of it picks
-  // up (see "Picking up an interrupted build"). A swarm, a worktree delegation
-  // and a batch keep their own continuation rule.
+  // A lowered fence building a plan edited after its approval, or revised for
+  // the person's change request: the receipt keeps the content the build
+  // started on, at the attempt it started in, so an interrupted build in the
+  // approval's own attempt picks up (see "Picking up an interrupted build"),
+  // and their next change request is judged against it (planAsSentBack). A
+  // swarm, a worktree delegation and a batch keep their own continuation rule.
   const started = pickUp && continuation && !receipt.batch
     ? buildContentFingerprint(continuation.artifacts.plan, continuation.artifacts.instructions, authority) : null;
   const startedOn = started !== null && started !== receipt.fingerprint ? { startedFingerprint: started } : {};
+  if (receipt.status === "generation") {
+    // An approval their change request carried was spent by the build their
+    // rejection closed; this build starts on the revision. Not in `originals`:
+    // a start that fails leaves nothing to undo (the value is bound to this
+    // attempt, which no judgement made in this attempt can match, and the
+    // retry writes it again), and their sweep is for receipts of this
+    // attempt, not of the one the approval was given in.
+    if (continuation?.carried && started !== null && started !== receipt.startedFingerprint) {
+      // The receipt as it stands now: the batch start may have marked it
+      // (`carriedInto`) since it was read, and that mark must stay.
+      const current = readPlanApprovalReceipt(projectDir, receipt) ?? receipt;
+      writePlanApprovalReceipt(projectDir, { ...current, startedFingerprint: started });
+    }
+    return changeNotices;
+  }
+  originals.push(receipt);
   if (receipt.override !== undefined) {
     // A break-glass receipt is bound to content and attempt only. There is
     // no certified source to compare or re-certify, and no race window to
