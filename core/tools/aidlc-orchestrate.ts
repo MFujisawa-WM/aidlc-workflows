@@ -284,6 +284,7 @@ import {
   type PlanChanges,
   planWithChanges,
   splitSlugList,
+  cachedClaimFanoutActive,
   hasAnyUnitClaimRefs,
   harnessDirectiveLimit,
   installedKiroLayout,
@@ -5247,6 +5248,9 @@ function unitClaimAskDirective(
 
 export interface TeamConstructionBoard {
   grid: string;
+  // The Units being worked under a claim, as the overview's opening rule reads
+  // them (a landed Unit is done, though its claim record still says claimed).
+  claimed: Array<{ unit: string; owner: string }>;
   claims: Array<{
     unit: string;
     status: "claimed" | "released";
@@ -5264,7 +5268,6 @@ export interface TeamConstructionBoard {
   claimable: string[];
   blocked: Array<{ unit: string; blockedBy: string[] }>;
   warning?: string;
-  fanoutActive: boolean;
 }
 
 function observedClaimActivity(
@@ -5307,13 +5310,14 @@ export function buildTeamConstructionBoard(
   options: {
     readOnly?: boolean;
     overview?: UnitClaimOverview;
+    model?: TeamUnitProgressModel;
   } = {},
 ): TeamConstructionBoard {
   const overview = options.overview ??
     cachedUnitClaimOverview(projectDir, {
       writeCache: options.readOnly !== true,
     });
-  const model = deriveTeamUnitProgressModel(
+  const model = options.model ?? deriveTeamUnitProgressModel(
     projectDir,
     stateContent,
     undefined,
@@ -5456,14 +5460,14 @@ function assembleTeamConstructionBoard(
     .sort((a, b) => compareBoardKeys(a.unit, b.unit));
   return {
     grid,
+    claimed: overview.claimed
+      .map((row) => ({ unit: row.unit, owner: row.owner }))
+      .sort((a, b) => compareBoardKeys(a.unit, b.unit)),
     claims,
     awaitingMerge,
     claimable,
     blocked,
     ...(overview.warning ? { warning: overview.warning } : {}),
-    fanoutActive:
-      awaitingMerge.length > 0 ||
-      overview.claimed.length > 0,
   };
 }
 
@@ -5491,8 +5495,7 @@ export function renderTeamConstructionBoard(
     : board.blocked.map(
       (row) => `| ${row.unit} | ${row.blockedBy.join(", ")} |`,
     );
-  const claimedSummary = board.claims
-    .filter((claim) => claim.status === "claimed")
+  const claimedSummary = board.claimed
     .map((claim) => `${claim.unit} (${claim.owner})`)
     .join(", ") || "none";
   const blockedSummary = board.blocked
@@ -12603,11 +12606,25 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
           emit(unitClaimAskDirective(overview));
           return;
         }
+        const model = deriveTeamUnitProgressModel(
+          pd,
+          stateContent,
+          undefined,
+          undefined,
+          { readOnly: readOnlyBoard },
+        );
         const board = buildTeamConstructionBoard(pd, stateContent, {
           readOnly: readOnlyBoard,
           overview,
+          model,
         });
-        if (board.fanoutActive) {
+        // While the guard's fan-out check holds (a landed Unit's claim
+        // included) it refuses Unit work in this checkout, so the board stays
+        // up until the walk has no Unit left to take: every Unit merged.
+        const dag = resolveBoltBatches(pd);
+        const unitWorkLeft = dag.state === "ok" &&
+          dag.batches.flat().some((unit) => !model.mergedUnits.has(unit));
+        if (board.awaitingMerge.length > 0 || (unitWorkLeft && cachedClaimFanoutActive(pd))) {
           emit(noticeDirective(
             renderTeamConstructionBoard(board, "dispatcher"),
           ));
