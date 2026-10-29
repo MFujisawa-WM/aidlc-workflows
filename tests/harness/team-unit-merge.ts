@@ -513,6 +513,10 @@ export function prepareCandidate(
     /** The recorded Plan Approval answer line; the engine's recorder writes the
      *  chosen option with its letter by default. */
     answerLine?: string;
+    /** Claim with the unit-end rhythm: one approval on the last stage, none per stage. */
+    unitEnd?: boolean;
+    /** Claim with the per-stage rhythm by name, as on a main whose own rhythm is unit-end. */
+    perStage?: boolean;
     /** The per-Unit stages the candidate documents, reviews and approves; all
      *  five by default. A stage left out is one the Unit's kind owes nothing. */
     stages?: string[];
@@ -529,7 +533,14 @@ export function prepareCandidate(
 } {
   const checkout = clone(remote, label);
   if (options.crlf) git(checkout, ["config", "core.autocrlf", "false"]);
-  const claim = runMergeTool(UNIT, ["claim", unit, "--team", label], checkout);
+  const claim = runMergeTool(
+    UNIT,
+    [
+      "claim", unit, "--team", label,
+      ...(options.unitEnd ? ["--rhythm", "unit-end"] : options.perStage ? ["--rhythm", "per-stage"] : []),
+    ],
+    checkout,
+  );
   expect(claim.status, claim.out).toBe(0);
   options.afterClaim?.(checkout);
   const claimPayload = JSON.parse(claim.stdout);
@@ -708,12 +719,23 @@ export function prepareCandidate(
         review.completion,
       );
     }
+    if (options.unitEnd) continue;
     audit += auditBlock(
       "GATE_APPROVED",
       unit,
       generation,
       stage,
       `**Gate Scope**: per-stage\n**Gate Stages**: ${stage}\n**User Input**: Approve\n`,
+    );
+  }
+  const lastStage = stages[stages.length - 1];
+  if (options.unitEnd && lastStage) {
+    audit += auditBlock(
+      "GATE_APPROVED",
+      unit,
+      generation,
+      lastStage,
+      `**Gate Scope**: unit-end\n**Gate Stages**: ${stages.join(", ")}\n**User Input**: Approve\n`,
     );
   }
   const auditShard = auditShardName(checkout);
