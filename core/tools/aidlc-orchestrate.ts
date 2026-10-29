@@ -327,6 +327,7 @@ import {
   listSpaces,
   finishedWork,
   workStanding,
+  readUnitScopeStamp,
   workToPickUp,
   readProjectDescriptionAuthority,
   LEGACY_PLAN_APPROVAL_RECOVERY_CHOICE,
@@ -575,6 +576,7 @@ import {
   cachedUnitClaimOverview,
   localUnitClaimOverviewForIntent,
   type UnitClaimOverview,
+  type UnitClaimView,
 } from "./aidlc-unit.ts";
 import {
   type ApprovedComposerPlan,
@@ -5257,6 +5259,8 @@ export interface TeamConstructionBoard {
     owner: string;
     generation: number;
     observedActivity: string;
+    /** The worktree on this machine the claim is worked in, when one is. */
+    checkout?: { path: string; branch: string | null };
   }>;
   awaitingMerge: Array<{
     unit: string;
@@ -5325,6 +5329,7 @@ export function buildTeamConstructionBoard(
     { readOnly: options.readOnly === true },
   );
   return assembleTeamConstructionBoard(
+    projectDir,
     model.section,
     overview,
     unitMergeTransactions(projectDir),
@@ -5420,17 +5425,54 @@ export function buildTeamConstructionBoardForIntent(
       transactions,
     );
   return assembleTeamConstructionBoard(
+    projectDir,
     grid,
     overview,
     transactions,
   );
 }
 
+// Where each claimed Unit is worked on this machine: a git worktree of this
+// repository whose Unit scope holds that very claim (its nonce), with the
+// branch it is on. A claim worked in another clone or on another machine has
+// no entry. Read-only: git's worktree list and each worktree's scope file.
+function localClaimCheckouts(
+  projectDir: string,
+  claims: UnitClaimView[],
+): Map<string, { path: string; branch: string | null }> {
+  const found = new Map<string, { path: string; branch: string | null }>();
+  if (!claims.some((claim) => claim.status === "claimed")) return found;
+  const listed = Bun.spawnSync({
+    cmd: ["git", "worktree", "list", "--porcelain"],
+    cwd: projectDir,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (listed.exitCode !== 0) return found;
+  for (const block of new TextDecoder().decode(listed.stdout).split(/\r?\n\r?\n/)) {
+    const listedPath = /^worktree (.+)$/m.exec(block)?.[1];
+    if (!listedPath) continue;
+    const path = resolve(listedPath);
+    const stamp = readUnitScopeStamp(path);
+    const claim = stamp && claims.find((entry) =>
+      entry.status === "claimed" && entry.unit === stamp.unit && entry.nonce === stamp.nonce
+    );
+    if (!claim) continue;
+    found.set(claim.unit, {
+      path,
+      branch: /^branch refs\/heads\/(.+)$/m.exec(block)?.[1] ?? null,
+    });
+  }
+  return found;
+}
+
 function assembleTeamConstructionBoard(
+  projectDir: string,
   grid: string,
   overview: UnitClaimOverview,
   transactions: ReturnType<typeof unitMergeTransactions>,
 ): TeamConstructionBoard {
+  const checkouts = localClaimCheckouts(projectDir, [...overview.claims.values()]);
   const claims = [...overview.claims.values()]
     .sort((a, b) => compareBoardKeys(a.unit, b.unit))
     .map((claim) => ({
@@ -5439,6 +5481,7 @@ function assembleTeamConstructionBoard(
       owner: claim.owner,
       generation: claim.generation,
       observedActivity: observedClaimActivity(claim),
+      ...(checkouts.has(claim.unit) ? { checkout: checkouts.get(claim.unit)! } : {}),
     }));
   const awaitingMerge = transactions
     .filter((transaction) => transaction.status !== "complete")
@@ -5540,9 +5583,26 @@ export function renderTeamConstructionBoard(
       );
     }
   }
+  const claimedUnits = board.claims.filter((claim) => claim.status === "claimed");
   if (nextActions.length === 0) {
     nextActions.push(
-      "- No dispatcher action is pending; main may resume the normal Construction walk.",
+      claimedUnits.length === 0
+        ? "- No dispatcher action is pending; main may resume the normal Construction walk."
+        : mode === "dispatcher"
+        ? "- Nothing runs from this checkout: every Unit not yet merged is claimed or waits on one. " +
+          "Each claimed Unit is worked in its own checkout:"
+        : "- No dispatcher action is pending. Each claimed Unit is worked in its own checkout:",
+    );
+  } else if (claimedUnits.length > 0) {
+    nextActions.push("- Each claimed Unit is worked in its own checkout:");
+  }
+  for (const claim of claimedUnits) {
+    nextActions.push(
+      `  - \`${claim.unit}\` is claimed by ${claim.owner} (attempt ${claim.generation}): ${
+        claim.checkout
+          ? `worktree \`${claim.checkout.path}\`${claim.checkout.branch ? ` on branch \`${claim.checkout.branch}\`` : ""}.`
+          : "in a checkout not on this machine, or a separate clone."
+      }`,
     );
   }
   return [
