@@ -1320,7 +1320,7 @@ AskUserQuestion({
     options: [
       { label: "Approve" },
       { label: "Request Changes" },
-      { label: "Accept as-is", description: "Archive current version and move on" }
+      { label: "Accept as-is", description: "Approve it as it is and move on" }
     ]
   }]
 })
@@ -1336,7 +1336,6 @@ When the reply carries `accept_as_is: "next-revision"` (at the second request, b
 Options:
   - Approve (workflow complete)
   - Request Changes
-  - Start New Ideation Cycle
 ```
 
 ### Build-and-Test Failure Loop-Back
