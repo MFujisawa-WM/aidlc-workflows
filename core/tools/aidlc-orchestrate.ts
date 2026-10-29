@@ -423,6 +423,10 @@ import {
   kiroIdeLegacyPlanApprovalSessionId,
   kiroContextPressure,
   relativeCodekbDir,
+  codekbDir,
+  codekbStageRepos,
+  developerHandoffPaths,
+  recordFileTargetOrThrow,
   intentsRegistryPath,
   MANY_REPOS,
   codekbSourceSize,
@@ -646,7 +650,7 @@ import {
   planApprovalKeptReplyWaits,
   planApprovalOverrideOffers,
   withdrawPlanApprovalReplies,
-  preparePlanRecordFolders,
+  planRecordFolders,
   publishPlanApprovalAsk,
   publishPlanApprovalSkip,
   routeCodeGenerationPlanApproval,
@@ -2823,13 +2827,13 @@ function emit(requested: Directive): void {
         } else {
           recordPlanBuiltWithoutAsking(projectDir, prepared.transported);
         }
-        // From the step itself, not the part transported, so the folder is
-        // there while the rules still arrive. Without it the step still goes
-        // out: the agent can make the folder itself, as before.
+        // From the step itself, not the part transported, so the folders are
+        // there while the rules still arrive. Without them the step still goes
+        // out: the agent can make a folder itself, as before.
         try {
-          preparePlanRecordFolders(projectDir, directive);
+          prepareRecordFolders(projectDir, directive);
         } catch (e) {
-          recordHookDrop(projectDir, "plan-approval-ask", errorMessage(e));
+          recordHookDrop(projectDir, "record-folders", errorMessage(e));
         }
         settleBuiltPlanReviews(projectDir, prepared.transported);
         // Asked where their words belong, the person said the work in
@@ -7781,6 +7785,70 @@ export function bootstrapDirectiveMemory(
   } catch {
     // Diary bootstrap is best-effort; directive routing remains authoritative.
   }
+}
+
+// When a step is published, the record folder of each file it names (its
+// documents, a wave Unit's documents and questions file, the code plan, and
+// Reverse Engineering's scan handoff and staging folder for each repo) is made
+// first, so each one is a plain file write: the Copilot CLI's file tool makes
+// no folders ("Parent directory does not exist"). Only inside this work's
+// record or the space's code knowledge base, never through a link, never for a
+// path that still holds a placeholder; a `{repo}` path is each repo's. Every
+// folder it can make is made, then the first it could not make is thrown.
+export function prepareRecordFolders(projectDir: string, directive: Directive): void {
+  const named: string[] = [];
+  if (directive.kind === "run-stage") {
+    named.push(...directive.produces);
+    for (const entry of directive.wave?.entries ?? []) {
+      named.push(...entry.produces, ...(entry.questions_file === undefined ? [] : [entry.questions_file]));
+    }
+  }
+  const folders = new Set(planRecordFolders(projectDir, directive));
+  // A code knowledge base folder is made from the space's own folder, which
+  // holds the `codekb/` parent an older record may not have yet.
+  let codekb: { space: string; root: string } | null = null;
+  if (named.length > 0) {
+    const ctx = codekbCtxFor(projectDir);
+    const root = dirname(codekbDir(projectDir, ctx.codekbRepo, ctx.space));
+    codekb = { space: dirname(root), root };
+    for (const path of named) {
+      const each = path.includes(REPO_PLACEHOLDER)
+        ? ctx.repos.map((repo) => path.replaceAll(REPO_PLACEHOLDER, repo))
+        : [path];
+      for (const file of each) {
+        if (!file.includes("{")) folders.add(dirname(join(projectDir, ...file.split("/"))));
+      }
+    }
+    // The developer's scan handoff goes in the stage's own record folder, and
+    // the architect writes each repo's candidate in its staging folder, which
+    // codekb-publish swaps into the store (reverse-engineering.md).
+    if (directive.kind === "run-stage" && directive.stage === "reverse-engineering") {
+      for (const repo of codekbStageRepos(projectDir)) {
+        for (const handoff of developerHandoffPaths(projectDir, repo)) folders.add(dirname(handoff));
+        folders.add(join(engineDir(projectDir), `codekb-stage-${repo}`));
+      }
+    }
+  }
+  let failed: unknown = null;
+  const make = (root: string, folder: string): void => {
+    const rel = relative(root, folder);
+    try {
+      mkdirSync(recordFileTargetOrThrow(root, rel), { recursive: true });
+      recordFileTargetOrThrow(root, rel);
+    } catch (e) {
+      failed ??= e;
+    }
+  };
+  const inside = (root: string, folder: string): boolean => {
+    const rel = relative(root, folder);
+    return rel !== "" && !isAbsolute(rel) && rel.split(/[\\/]/)[0] !== "..";
+  };
+  const record = docsRoot(projectDir);
+  for (const folder of folders) {
+    if (inside(record, folder)) make(record, folder);
+    else if (codekb !== null && inside(codekb.root, folder)) make(codekb.space, folder);
+  }
+  if (failed !== null) throw failed;
 }
 
 // Derive the stage file path from phase + slug (the shipped layout:
