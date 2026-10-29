@@ -6,7 +6,6 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
-  linkSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -509,6 +508,7 @@ import {
   PERSON_ASKED_SKIP_REASON,
   personsWordsText,
   declaredProjectType,
+  installWithoutReplacing,
 } from "./aidlc-lib.ts";
 import { GUARD_POLICY_GLOSS, SCOPE_GLOSS } from "./aidlc-guard-fences.ts";
 import { validateStageFrontmatter } from "./aidlc-stage-schema.ts";
@@ -540,7 +540,7 @@ import {
   withFileLineEndings,
 } from "./aidlc-plugin.ts";
 import { pluginTestCommand, renderPluginTestHelp, resolveHookPath } from "./aidlc.ts";
-import { executePlan } from "./aidlc-transaction.ts";
+import { executePlan, withTransactionFix } from "./aidlc-transaction.ts";
 import {
   aidlcDispatcherInvocation,
   aidlcInvocation,
@@ -1504,7 +1504,7 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
       }
     } catch (err) {
       resetSelectionSensitiveCaches();
-      die(`select-plugins failed: ${errorMessage(err)}`);
+      die(`select-plugins failed: ${withTransactionFix(err, errorMessage(err))}`);
     } finally {
       rmSync(stagingRoot, { recursive: true, force: true });
     }
@@ -1745,7 +1745,7 @@ async function handlePluginSync(projectDir: string, pluginRoot: string | undefin
         }
         await mod.compose();
       } catch (error) {
-        die(`plugin-sync failed for ${item.root}: ${errorMessage(error)}`);
+        die(`plugin-sync failed for ${item.root}: ${withTransactionFix(error, errorMessage(error))}`);
       } finally {
         for (const key of envKeys) {
           const value = previous[key];
@@ -10821,8 +10821,13 @@ function documentInputNoTextReason(shown: { state: string }): string {
 // and any other moves the copy to <stem>-2<ext>, -3, and so on. Leading dots
 // are dropped and the names the knowledge walk skips are passed over, so a
 // later sync still sees the copy. The bytes land in a dot-named staging file
-// first and are published with link(), which never replaces a name.
+// first and are published with installWithoutReplacing, which never replaces a
+// name, whichever temp folder or computer the other copy runs from.
 const DOCUMENT_INPUT_COPY_NAME_LIMIT = 100;
+// ponytail: a 0-byte file made this second may be another copy's claim that
+// fills a moment later; a claim that takes over a second to fill leaves a -2
+// copy with the same bytes.
+const DOCUMENT_INPUT_CLAIM_SETTLE_MS = 1_000;
 
 function copyIntoDocuments(
   kb: typeof import("./aidlc-knowledge.ts"),
@@ -10840,7 +10845,15 @@ function copyIntoDocuments(
     const target = join(documentsReal, candidate);
     // A file already at this name with the same bytes is this copy already.
     const holdsSameBytes = (): boolean => {
-      const existing = lstatSync(target, { throwIfNoEntry: false });
+      let existing = lstatSync(target, { throwIfNoEntry: false });
+      for (
+        const deadline = Date.now() + DOCUMENT_INPUT_CLAIM_SETTLE_MS;
+        existing?.isFile() && existing.size === 0 && bytes.length > 0 &&
+        Date.now() - existing.mtimeMs < DOCUMENT_INPUT_CLAIM_SETTLE_MS && Date.now() < deadline;
+      ) {
+        Bun.sleepSync(5);
+        existing = lstatSync(target, { throwIfNoEntry: false });
+      }
       if (existing === undefined || !existing.isFile() || existing.size !== bytes.length) return false;
       try {
         return kb.sha256Hex(kb.readDocumentBytes(target, candidate, undefined, bytes.length)) === digest;
@@ -10855,7 +10868,7 @@ function copyIntoDocuments(
     const staged = join(documentsReal, `.aidlc-document-input-${process.pid}-${randomUUID()}.tmp`);
     try {
       writeFileSync(staged, bytes, { flag: "wx" });
-      linkSync(staged, target);
+      installWithoutReplacing(staged, target);
       return { target, created: true };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
