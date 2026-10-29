@@ -5724,8 +5724,17 @@ export function beginCodeGenerationBatch(
           // receipt stands at `generation` with that build's ticks on the plan.
           // Those ticks are the previous attempt's progress, not this build's:
           // the revised plan starts its steps fresh, as a new approval does.
-          if ((started.receipt.status !== "generation" || started.continuation?.carried) && pickUp) {
+          // Once: this start runs before every change the build makes, and the
+          // carried receipt stays at `generation`, so the first start in this
+          // attempt marks it (`carriedInto`) and later ones keep the ticks the
+          // build has made since.
+          const carriedFresh = started.continuation?.carried === true &&
+            started.receipt.carriedInto !== started.authority.runFloor;
+          if ((started.receipt.status !== "generation" || carriedFresh) && pickUp) {
             clearPlanFileTicks(projectDir, started.authority.stageDir);
+          }
+          if (carriedFresh) {
+            writePlanApprovalReceipt(projectDir, { ...started.receipt, carriedInto: started.authority.runFloor });
           }
           notices.push(...publishCodeGenerationStart(projectDir, started, options, originals, pickUp));
         }
