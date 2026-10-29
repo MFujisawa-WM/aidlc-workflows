@@ -271,7 +271,6 @@ import {
   latestMainWorkflowStageRunFloorForProject,
   unitLifecycleRunFloorForProject,
   unitScopedLifecycleFloors,
-  latestReviewRecordRefs,
   isAutonomousConstructionGate,
   isConstructionSwarmEnabled,
   installedHarnessName,
@@ -434,8 +433,6 @@ import {
   relativeRecordDirForSelection,
   relativeSpaceRecordPrefix,
   reviewArtifactEntries,
-  reviewAttemptWindow,
-  setField,
   settleConflictedState,
   isReadOnlyNextArgv,
   withoutEntryWord,
@@ -640,6 +637,8 @@ import { inspectRequiredArtifactInstances } from "./aidlc-artifact-resolution.ts
 import { renderEngineInvocation, sameGuardOperation } from "./aidlc-guard-operation.ts";
 import {
   isPlanApprovalBeat,
+  codeGenerationBuildFinishes,
+  codeGenerationFinishedBuild,
   keepRoutedPlanApprovalReply,
   legacyPlanApprovalOffNotice,
   noteOpenEngineQuestion,
@@ -659,6 +658,7 @@ import {
   codeGenerationIssuance,
   codeGenerationPlanWaits,
   codeGenerationPlanWaitsStep,
+  reviewClassOnRecord,
   codeGenerationResume,
   codeGenerationResumeNarration,
   codeGenerationStartNarration,
@@ -12878,38 +12878,11 @@ function retainGateReview(
 ): void {
   const node = nodeForSlug(directive.stage);
   if (!node?.reviewer || !node.review_artifact) return;
-  const ref = latestReviewRecordRefs(projectDir, node).get(directive.unit ?? "");
-  if (ref === undefined) return;
-  const attempt = reviewAttemptWindow(projectDir, stateContent, node);
-  const completion = attempt.events.slice(attempt.floorIdx + 1).findLast((event) =>
-    event.event === "REVIEW_COMPLETED" &&
-    (ref !== null
-      ? event.block === ref.completion
-      : auditBlockField(event.block, "Stage") === node.slug &&
-        auditBlockField(event.block, "Reviewer") === node.reviewer &&
-        (auditBlockField(event.block, "Unit") ?? "") === (directive.unit ?? "") &&
-        auditBlockField(event.block, "Workflow") === null)
-  );
-  if (!completion) return;
-  let reviewState = stateContent;
-  for (const event of sortAttemptEvents(attempt.allEvents).reverse()) {
-    if (event.block === completion.block) break;
-    if (event.event === "REVIEW_CLASS_CHANGED") {
-      const old = auditBlockField(event.block, "Old Override");
-      if (old !== null) {
-        reviewState = setField(reviewState, "Review Override", old === "none set" ? "" : old);
-      }
-    } else if (event.event === "SCOPE_CHANGED") {
-      const old = auditBlockField(event.block, "Old Scope");
-      if (old !== null) reviewState = setField(reviewState, "Scope", old);
-    }
-  }
+  const reviewClass = reviewClassOnRecord(projectDir, stateContent, node, directive.unit ?? null);
+  if (reviewClass === null) return;
   directive.reviewer = node.reviewer;
   directive.review_artifact = node.review_artifact;
-  const reviewClass = resolveReviewClass(node.review_class, getField(reviewState, "Scope") ?? "", reviewState);
-  // Legacy/manual state edits may carry no setting-change row. A verified
-  // completion still proves review happened; retain the declared class then.
-  directive.review_class = reviewClass === "none" ? node.review_class ?? "adversarial" : reviewClass;
+  directive.review_class = reviewClass;
 }
 
 function applySettledSwarmShape(
@@ -13704,17 +13677,25 @@ function approvalOverReview(
 // when no such request does: per Unit with a Unit DAG the Unit routes own the
 // review (team ownership without a DAG is an error the route states, which a
 // review step must not hide), and a class that resolves to none has no review.
+// With `finishedBuild`, a stage-level Code Generation build whose plan stands as
+// its finished build reads it (codeGenerationBuildFinishes) is read with the
+// class its review on record ran under, as its completion reads it, whatever
+// the review setting says now, so `next` hands over its finish.
 function stageLevelReviewClass(
   projectDir: string,
   node: GraphStage,
   scope: string,
   stateContent: string,
+  finishedBuild = false,
 ): ReviewClass | null {
   if (!node.reviewer) return null;
   if (
     isPerUnit(node) && !usesStageLevelPerUnitArtifacts(scope, stateContent) &&
     (resolveBoltDag(projectDir).state !== "none" || isTeamUnitOwnership(stateContent))
   ) return null;
+  if (finishedBuild && node.slug === "code-generation" && codeGenerationBuildFinishes(projectDir, null)) {
+    return reviewClassOnRecord(projectDir, stateContent, node, null);
+  }
   const reviewClass = resolveReviewClass(node.review_class ?? "adversarial", scope, stateContent);
   return reviewClass === "none" ? null : reviewClass;
 }
@@ -13733,7 +13714,7 @@ function stageReviewStep(
   stateContent: string | null,
 ): { text: string; endsTurn: boolean; finished: boolean } | null {
   if (stateContent === null || !node.reviewer || isReadOnlyEngineProbe()) return null;
-  const reviewClass = stageLevelReviewClass(projectDir, node, scope, stateContent);
+  const reviewClass = stageLevelReviewClass(projectDir, node, scope, stateContent, true);
   if (reviewClass === null) return null;
   const review = freshReviewReceipts(projectDir, stateContent, node, { reviewClass });
   const pending = review.stagePending;
@@ -13770,7 +13751,11 @@ function stageReviewStep(
 // note the person picked at the learnings question not written yet (the step
 // can run again there). Past that, a learnings question asked since the stage
 // started (since its latest Request Changes, for a stage being revised) has its
-// answer, so the step goes on to the gate and never asks it twice.
+// answer, so the step goes on to the gate and never asks it twice. A
+// stage-level Code Generation build reviewed under its plan's contract, which
+// moved since (a practice kept after the review), gets this step too: its own
+// route would hand over the build again, which the guard then refuses. When the
+// person asked to see the plan again, its own route shows them the plan.
 function finishedReviewStep(
   projectDir: string,
   node: GraphStage,
@@ -13778,9 +13763,9 @@ function finishedReviewStep(
   review: FreshReviewReceipts,
   reviewClass: ReviewClass,
 ): { text: string; endsTurn: boolean; finished: boolean } | null {
-  if (isPerUnit(node)) return null;
   const box = parseCheckboxes(stateContent).find((row) => row.slug === node.slug)?.state;
   if (review.stageVerdict === null || (box !== "in-progress" && box !== "revising")) return null;
+  if (isPerUnit(node) && !(node.slug === "code-generation" && codeGenerationBuildFinishes(projectDir, null))) return null;
   if (openDecisionMenu(projectDir, node.slug, stageQuestionBoundary(box)).length > 0) return null;
   const learnings = learningsSinceStageStart(projectDir, node.slug, box);
   if (!learnings.settled) return null;
@@ -15583,10 +15568,11 @@ function codeGenerationCompletionWaits(
   if (node.slug !== "code-generation") return null;
   const marker = readActiveDirectiveMarker(projectDir, stateContent);
   if (guardRecoveryAnswerAdmits(marker, ["engine", "orchestrate", "report", ...args], projectDir)) return null;
-  return codeGenerationCompletionPlanWaits(
+  const waits = codeGenerationCompletionPlanWaits(
     projectDir, stateContent, isolated ? [null] : codeGenerationReportTargets(projectDir, node, scope, stateContent, unit),
-  )
-    ? printDirective(codeGenerationPlanWaitsStep(isolated ? { scope } : undefined))
+  );
+  return waits
+    ? printDirective(codeGenerationPlanWaitsStep(isolated ? { scope } : undefined, waits === "plan-review"))
     : null;
 }
 
@@ -15594,19 +15580,24 @@ function codeGenerationCompletionWaits(
  * Whether a Code Generation completion for these targets waits on the person:
  * only while plan approval is on for this work (read as `next` reads it, so the
  * scope, the person's switch and the trusted machine switch all count), and then
- * while a target has no approval that lets it build. `unit complete` asks too.
+ * "plan" while a target has no approval that lets it build. It also waits,
+ * "plan-review", when a target's plan stands only as its finished build reads it
+ * and a plan review the person asked for is pending (codeGenerationFinishedBuild),
+ * so `next` shows them the plan first. False when it does not wait.
+ * `unit complete` asks too.
  */
 export function codeGenerationCompletionPlanWaits(
   projectDir: string,
   stateContent: string,
   units: ReadonlyArray<string | null>,
-): boolean {
+): false | "plan" | "plan-review" {
   try {
     if (resolvePlanApprovalSetting(projectDir, stateContent).value === "off") return false;
   } catch {
     return false;
   }
-  return codeGenerationPlanWaits(projectDir, units);
+  if (codeGenerationPlanWaits(projectDir, units)) return "plan";
+  return units.some((unit) => codeGenerationFinishedBuild(projectDir, unit) === "plan-review") ? "plan-review" : false;
 }
 
 // The Code Generation targets a completion report covers: the Unit it names,

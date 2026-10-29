@@ -17602,6 +17602,10 @@ export interface FreshReviewReceipts {
    *  records that no reviewer had finished (reviewCompletionWithoutReviewer).
    *  Read only beside stageVerdict / unitVerdicts, for the one line the gate says. */
   noReviewerVerdicts?: Set<string>;
+  /** The audit block of each scope's fresh terminal receipt ("" for the stage,
+   *  else the Unit), for a field another owner wrote on it. Read only beside
+   *  stageVerdict / unitVerdicts. */
+  verdictBlocks?: Map<string, string>;
   /**
    * Units with a merge-confirmed Bolt attempt. A name-only attempt is
    * confirmed by its BOLT_COMPLETED row; a slug-backed (worktree) attempt is
@@ -21742,6 +21746,7 @@ export function freshReviewReceipts(
     editedVerdicts: new Set(),
     dictatedVerdicts: new Set(),
     noReviewerVerdicts: new Set(),
+    verdictBlocks: new Map(),
     mergedBoltUnits: new Set(),
     openBoltUnits: new Set(),
     acceptedChanges: [],
@@ -21853,6 +21858,7 @@ export function freshReviewReceipts(
   const editedVerdicts = new Set<string>();
   const dictatedVerdicts = new Set<string>();
   const noReviewerVerdicts = new Set<string>();
+  const verdictBlocks = new Map<string, string>();
   const unitStale = new Set<string>();
   const unitStaleProgress = new Map<string, StaleReviewProgress>();
   const unitIterations = new Map<string, number>();
@@ -22297,6 +22303,7 @@ export function freshReviewReceipts(
     else dictatedVerdicts.delete(unit ?? "");
     if (reviewCompletionWithoutReviewer(e.block)) noReviewerVerdicts.add(unit ?? "");
     else noReviewerVerdicts.delete(unit ?? "");
+    verdictBlocks.set(unit ?? "", e.block);
     if (unit) {
       unitVerdicts.set(unit, terminalVerdict);
       unitStale.delete(unit);
@@ -22794,6 +22801,7 @@ export function freshReviewReceipts(
     editedVerdicts,
     dictatedVerdicts,
     noReviewerVerdicts,
+    verdictBlocks,
     mergedBoltUnits,
     openBoltUnits,
     acceptedChanges: [

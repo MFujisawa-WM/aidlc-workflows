@@ -26,6 +26,12 @@ import {
   assertNoSymlinkInChainOrThrow,
   auditBlockField,
   boltSlugForUnit,
+  freshReviewReceipts,
+  loadStageGraph,
+  resolveReviewClass,
+  latestReviewRecordRefs,
+  reviewAttemptWindow,
+  setField,
   collectStalePlanApprovalReceipts,
   commitPlanApprovalBatch,
   planApprovalBatchCommitted,
@@ -2905,10 +2911,119 @@ function planApprovedOnRecord(projectDir: string, targetId: string, fingerprint:
   return last !== undefined && last.event !== "QUESTION_ANSWERED";
 }
 
+/**
+ * How an approval is read: for a build to start or go on (`build`), or for the
+ * build that already ran to be reported complete (`completion`). They differ in
+ * one thing only, the Testing Contract the approval is checked against.
+ */
+export type CodeGenerationApprovalUse = "build" | "completion";
+
+/** The review row field that keeps the Testing Contract in force when a Code Generation verdict was recorded. */
+export const REVIEW_TESTING_CONTRACT_FIELD = "Testing Contract";
+
+/**
+ * The Testing Contract in force for a Code Generation review being recorded:
+ * the boundary that says the build it reviews was finished under it. Null when
+ * the posture cannot be read, so the row carries no boundary.
+ */
+export function reviewedTestingContract(projectDir: string): string | null {
+  try {
+    return resolveTestingPosture(projectDir).contract_sha256;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The class the scope's review on record ran under, or null with none on record
+ * in this attempt. The review is the REVIEW_COMPLETED latestReviewRecordRefs
+ * names, inside the attempt window (for a legacy embedded review, the newest one
+ * there for the stage, reviewer and Unit); its class is the state's
+ * Scope and Review Override with every later REVIEW_CLASS_CHANGED and
+ * SCOPE_CHANGED row undone, since a setting changed after a review governs
+ * later work, not the review on record. The gate's retained review and the
+ * Code Generation completion both read it here.
+ */
+export function reviewClassOnRecord(
+  projectDir: string,
+  stateContent: string,
+  node: ReturnType<typeof loadStageGraph>[number],
+  unit: string | null,
+): "adversarial" | "advisory" | null {
+  if (!node.reviewer) return null;
+  const ref = latestReviewRecordRefs(projectDir, node).get(unit ?? "");
+  if (ref === undefined) return null;
+  const attempt = reviewAttemptWindow(projectDir, stateContent, node);
+  const completion = attempt.events.slice(attempt.floorIdx + 1).findLast((event) =>
+    event.event === "REVIEW_COMPLETED" &&
+    (ref !== null
+      ? event.block === ref.completion
+      : auditBlockField(event.block, "Stage") === node.slug &&
+        auditBlockField(event.block, "Reviewer") === node.reviewer &&
+        (auditBlockField(event.block, "Unit") ?? "") === (unit ?? "") &&
+        auditBlockField(event.block, "Workflow") === null)
+  );
+  if (!completion) return null;
+  return reviewClassAtReview(node, stateContent, attempt.allEvents, completion.block);
+}
+
+// A state edited by hand carries no setting-change row, and a review on record
+// still proves one ran, so a class that reads `none` there is the stage's
+// declared one.
+function reviewClassAtReview(
+  node: { review_class?: "adversarial" | "advisory" },
+  stateContent: string,
+  allEvents: AuditShardEvent[],
+  completionBlock: string,
+): "adversarial" | "advisory" {
+  let reviewState = stateContent;
+  for (const event of sortAttemptEvents(allEvents).reverse()) {
+    if (event.block === completionBlock) break;
+    if (event.event === "REVIEW_CLASS_CHANGED") {
+      const old = auditBlockField(event.block, "Old Override");
+      if (old !== null) reviewState = setField(reviewState, "Review Override", old === "none set" ? "" : old);
+    } else if (event.event === "SCOPE_CHANGED") {
+      const old = auditBlockField(event.block, "Old Scope");
+      if (old !== null) reviewState = setField(reviewState, "Scope", old);
+    }
+  }
+  const reviewClass = resolveReviewClass(node.review_class, getField(reviewState, "Scope") ?? "", reviewState);
+  return reviewClass === "none" ? node.review_class ?? "adversarial" : reviewClass;
+}
+
+/**
+ * Whether the target's build was finished under this contract: the terminal
+ * review freshReviewReceipts keeps for it still covers the work, and was
+ * recorded while this contract was in force. A practice kept at the gate (or
+ * any other posture move) after that review is for the next build; a review
+ * recorded after a move, or one with no contract on record, keeps the build
+ * waiting. Whether the source still matches is the completion's own check.
+ * An isolated run reads as the main workflow's receipts never cover it.
+ */
+function reviewedUnderContract(projectDir: string, authority: CodeGenerationAuthority, contractHash: string): boolean {
+  try {
+    const node = loadStageGraph().find((stage) => stage.slug === CODE_GENERATION_STAGE);
+    if (!node?.reviewer || singleStageAttemptIsOpen(projectDir, CODE_GENERATION_STAGE)) return false;
+    const state = readFileSync(stateFilePath(projectDir), "utf-8");
+    const unit = authority.unit;
+    const reviewClass = reviewClassOnRecord(projectDir, state, node, unit);
+    if (reviewClass === null) return false;
+    const fresh = freshReviewReceipts(projectDir, state, node, { reviewClass });
+    const covered = unit === null
+      ? fresh.stageVerdict !== null && !fresh.stageStale
+      : fresh.unitVerdicts.has(unit) && !fresh.unitStale.has(unit);
+    const block = covered ? fresh.verdictBlocks?.get(unit ?? "") : undefined;
+    return block !== undefined && auditBlockField(block, REVIEW_TESTING_CONTRACT_FIELD) === contractHash;
+  } catch {
+    return false;
+  }
+}
+
 function codeGenerationApprovalArtifacts(
   projectDir: string,
   authority: CodeGenerationAuthority,
   contractProjectDir = projectDir,
+  use: CodeGenerationApprovalUse = "build",
 ): {
   plan: string;
   instructions: string;
@@ -2917,6 +3032,8 @@ function codeGenerationApprovalArtifacts(
   instructionsExist: boolean;
   approvedAnswer: boolean;
   contractValid: boolean;
+  /** At completion: the contract moved after the build was reviewed under the plan's own. */
+  builtUnderPlanContract: boolean;
   contractHash: string | null;
   expectedFingerprint: string | null;
   recordedFingerprint: string | null;
@@ -2951,12 +3068,17 @@ function codeGenerationApprovalArtifacts(
     embedded !== null &&
     current !== null &&
     embedded.contract_sha256 === current.contract_sha256;
+  // A delegated approval (validateWorktreeDelegation) reads the parent's
+  // contract while the review rows here are the worker checkout's, so the
+  // exception is not read for it; handleReview records none in a swarm worker.
+  const builtUnderPlanContract = use === "completion" && !contractValid && embedded !== null &&
+    contractProjectDir === projectDir && reviewedUnderContract(projectDir, authority, embedded.contract_sha256);
   const expectedFingerprint =
-    planExists && instructionsExist && contractValid && current
+    planExists && instructionsExist && embedded !== null && (contractValid || builtUnderPlanContract)
       ? approvalFingerprint(
           plan,
           instructions,
-          current.contract_sha256,
+          embedded.contract_sha256,
           authority,
         )
       : null;
@@ -2968,6 +3090,7 @@ function codeGenerationApprovalArtifacts(
     instructionsExist,
     approvedAnswer,
     contractValid,
+    builtUnderPlanContract,
     contractHash,
     expectedFingerprint,
     recordedFingerprint,
@@ -3293,7 +3416,9 @@ function recordContinuedStaleContract(projectDir: string, continuation: CodeGene
 /**
  * Whether the plan behind a Code Generation completion still waits on the
  * person: a target has no approval that lets it build (no plan yet, not
- * approved, or changed since under strict), the check the build itself meets.
+ * approved, or changed since under strict), the check the build itself meets,
+ * except that a Testing Contract that moved after the build was reviewed under
+ * the plan's own (a testing practice kept at the gate) does not hold it.
  * Each target is judged as its own build step would be, never through the step
  * marker, which the gate's opening retires. A judgement that throws counts as
  * no wait, so the completion's own checks decide.
@@ -3302,11 +3427,31 @@ export function codeGenerationPlanWaits(projectDir: string, units: ReadonlyArray
   return units.some((unit) => {
     try {
       const issued: CodeGenerationIssuance = unit === null ? { kind: "run-stage" } : { kind: "run-stage", unit };
-      return !codeGenerationExecutionAllowed(projectDir, { unit }, undefined, issued);
+      const approval = evaluateCodeGenerationApproval(projectDir, { unit }, issued, "completion");
+      return !codeGenerationExecutionAllowed(projectDir, { unit }, approval, issued);
     } catch {
       return false;
     }
   });
+}
+
+/**
+ * Whether the target's build is finished as its plan stands: the build reading
+ * refuses because the Testing Contract moved, while the completion reading
+ * holds because the build was reviewed under the plan's own contract (a
+ * practice kept after the review). Whether its next step is the finish also
+ * depends on the person not having asked to see the plan again
+ * (codeGenerationBuildFinishes).
+ */
+export function codeGenerationFinishedUnderPlanContract(projectDir: string, unit: string | null): boolean {
+  try {
+    const issued: CodeGenerationIssuance = unit === null ? { kind: "run-stage" } : { kind: "run-stage", unit };
+    const approval = evaluateCodeGenerationApproval(projectDir, { unit }, issued, "completion");
+    return approval.ok && !approval.contractValid &&
+      codeGenerationExecutionAllowed(projectDir, { unit }, approval, issued);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -3341,9 +3486,11 @@ export function stepNextCommand(projectDir: string, step: { single?: boolean; st
  * The step a completion gets while its plan waits: the plan's question is
  * `next`'s, and an isolated run's is its own (isolatedCodeGenerationNext).
  */
-export function codeGenerationPlanWaitsStep(isolated?: { scope: string }): string {
+export function codeGenerationPlanWaitsStep(isolated?: { scope: string }, reviewAsked = false): string {
   const next = isolated === undefined ? `${aidlcToolInvocation("orchestrate")} next` : isolatedCodeGenerationNext(isolated.scope);
-  return `The code plan is not approved yet: run \`${next}\` and follow the step it prints.`;
+  // An approved plan the person asked to see again is not "not approved".
+  const why = reviewAsked ? "The person asked to see the code plan again" : "The code plan is not approved yet";
+  return `${why}: run \`${next}\` and follow the step it prints.`;
 }
 
 function recordCodeGenerationContinuation(
@@ -3876,14 +4023,16 @@ export function recordPlanApprovalBatchReceipts(
   });
 }
 
-function assertPlanApprovalBatchCurrent(projectDir: string, receipt: PlanApprovalRuntimeReceipt): void {
+function assertPlanApprovalBatchCurrent(
+  projectDir: string, receipt: PlanApprovalRuntimeReceipt, use: CodeGenerationApprovalUse = "build",
+): void {
   const batch = receipt.batch as BoundPlanApprovalBatch;
   const marker = assertPlanApprovalBatchLifecycle(projectDir, receipt);
   const batchPeers = { units: batch.members.map((member) => member.unit), markerSha256: hashObject(marker) };
   const members = batch.members.map((member) => {
     const evidence = planApprovalQuestionEvidence(
       projectDir, codeGenerationAuthority(projectDir, { unit: member.unit }, batchPeers),
-      member.questionsFile, "Approve Plan", { breakGlass: true },
+      member.questionsFile, "Approve Plan", { breakGlass: true, use },
     );
     const current = planApprovalBatchMember(evidence);
     const peer = readPlanApprovalReceipt(projectDir, current);
@@ -4527,6 +4676,8 @@ export interface PlanApprovalEvidenceOptions {
   breakGlass?: boolean;
   /** Group validation must not re-baseline one member before validating others. */
   batch?: boolean;
+  /** A completion reads each member against the contract its build ran under. */
+  use?: CodeGenerationApprovalUse;
 }
 
 export function codeGenerationPlanApprovalQuestionEvidence(
@@ -4559,11 +4710,11 @@ function planApprovalQuestionEvidence(
       `Plan Approval questions file must be the active target's canonical file: ${toPosix(relative(projectDir, expectedPath))}`,
     );
   }
-  const artifacts = codeGenerationApprovalArtifacts(projectDir, authority);
+  const artifacts = codeGenerationApprovalArtifacts(projectDir, authority, projectDir, options.use);
   if (!artifacts.planExists || !artifacts.instructionsExist) {
     throw new Error("Plan Approval requires non-empty plan and unit-test instructions");
   }
-  if (!artifacts.contractValid || artifacts.expectedFingerprint === null) {
+  if ((!artifacts.contractValid && !artifacts.builtUnderPlanContract) || artifacts.expectedFingerprint === null) {
     throw new Error(
       `Plan Approval requires the current Testing Contract: ${testingContractDefectReason(artifacts.plan) ??
         "the embedded contract is stale because memory, scope, test strategy, project type, or the installed AIDLC version changed. " +
@@ -5353,9 +5504,11 @@ function delegatedPlanChangedReason(
 
 function validateWorktreeDelegation(
   childDir: string, authority: CodeGenerationAuthority, receipt: PlanApprovalRuntimeReceipt,
+  use: CodeGenerationApprovalUse = "build",
 ): string {
   const parent = worktreeDelegationParent(childDir, authority, receipt);
-  if (!codeGenerationExecutionAllowed(parent, { unit: authority.unit })) {
+  const target = { unit: authority.unit };
+  if (!codeGenerationExecutionAllowed(parent, target, evaluateCodeGenerationApproval(parent, target, undefined, use))) {
     throw new Error("Parent Plan Approval is no longer current and its fence is raised.");
   }
   return parent;
@@ -5389,6 +5542,7 @@ export function evaluateCodeGenerationApproval(
   projectDir: string,
   target: CodeGenerationTarget,
   issued?: CodeGenerationIssuance,
+  use: CodeGenerationApprovalUse = "build",
 ): CodeGenerationApproval {
   let normalizedUnit: string | null = null;
   const empty: CodeGenerationApproval = {
@@ -5421,8 +5575,8 @@ export function evaluateCodeGenerationApproval(
     // A worker executes the parent's approved contract, including for a sibling
     // repository that does not carry the workspace's methodology files.
     const contractProject = candidate?.delegation
-      ? validateWorktreeDelegation(projectDir, authority, candidate) : projectDir;
-    const artifacts = codeGenerationApprovalArtifacts(projectDir, authority, contractProject);
+      ? validateWorktreeDelegation(projectDir, authority, candidate, use) : projectDir;
+    const artifacts = codeGenerationApprovalArtifacts(projectDir, authority, contractProject, use);
     empty.planExists = artifacts.planExists;
     empty.instructionsExist = artifacts.instructionsExist;
     empty.approved = artifacts.approvedAnswer;
@@ -5472,7 +5626,7 @@ export function evaluateCodeGenerationApproval(
       empty.reason = "The Testing Contract has missing or inconsistent executable fields. Repair its methodology, obligations, and plan profile before continuing.";
       return empty;
     }
-    if (!empty.contractValid) {
+    if (!empty.contractValid && !artifacts.builtUnderPlanContract) {
       empty.reason =
         "the approved Testing Contract is stale because memory, scope, test strategy, project type, or the installed AIDLC version changed";
       return empty;
@@ -5531,7 +5685,7 @@ export function evaluateCodeGenerationApproval(
     const receipt = readPlanApprovalReceipt(projectDir, identity);
     if (receipt?.delegation) {
       if (hashObject(receipt) !== hashObject(candidate)) throw new Error("Worktree approval changed while reading.");
-    } else if (receipt?.batch) assertPlanApprovalBatchCurrent(projectDir, receipt);
+    } else if (receipt?.batch) assertPlanApprovalBatchCurrent(projectDir, receipt, use);
     // Source that moved after the receipt certified it never retires the
     // approval: the approval is about the plan, and generation start records
     // the move as one notice line and re-baselines the receipt. Only a source

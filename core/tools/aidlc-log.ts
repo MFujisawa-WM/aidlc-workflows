@@ -304,6 +304,8 @@ import {
   recordPlanApprovalOverrideReceipt,
   recordPlanApprovalReceipt,
   recordPlanApprovalLegacyRecoveryAnswer,
+  REVIEW_TESTING_CONTRACT_FIELD,
+  reviewedTestingContract,
 } from "./aidlc-testing-posture.js";
 import { aidlcDispatcherInvocation, aidlcEngineCommand, entrySkillInvocation, quoteCommandArgument, swarmUnitTestCommand } from "./aidlc-runtime-paths.ts";
 import {
@@ -5210,6 +5212,19 @@ function handleReview(args: string[]): void {
       }
       fields["Review Record"] = slot.recordRelative;
       fields["Review Record Digest"] = reviewRecordDigest(serialized);
+      // The build this verdict covers was finished under the Testing Contract
+      // in force now; the completion reads it to tell a practice kept at the
+      // gate from a contract that moved while the build ran. A swarm worker's
+      // checkout (swarmWorkerWorktreeMeta) resolves its own memory while its
+      // approval may read the parent's, so its verdict records none and its
+      // completion is held for a moved contract, as with no contract on record.
+      // A delegated approval also never reads the field
+      // (codeGenerationApprovalArtifacts), which covers a worker checkout whose
+      // meta does not validate. A person's own Unit worktree records it.
+      const reviewedContract = flags.stage === "code-generation" && swarmWorkerWorktreeMeta(pd) === null
+        ? reviewedTestingContract(pd)
+        : null;
+      if (reviewedContract !== null) fields[REVIEW_TESTING_CONTRACT_FIELD] = reviewedContract;
       recordPath = slot.recordRelative;
       emitAudit(pd, "REVIEW_COMPLETED", fields, intent, space);
       // The draft was the reviewer's input; the record now holds it. The

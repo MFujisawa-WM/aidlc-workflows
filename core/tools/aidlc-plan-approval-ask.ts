@@ -98,9 +98,11 @@ import {
   replaceTestingContractSection,
   resolveCodeGenerationAuthority,
   resolveTestingPosture,
+  codeGenerationFinishedUnderPlanContract,
   stepNextCommand,
   testingContractDefectMessage,
   usableTestingContract,
+  type CodeGenerationApprovalUse,
   type CodeGenerationIssuance,
   type PlanApprovalPickerQuestion,
 } from "./aidlc-testing-posture.ts";
@@ -364,6 +366,48 @@ function pendingBuiltPlanReviews(projectDir: string, intentId: string): PendingP
     pending.push({ unit, targetId: value.targetId, ...(value.feedback ? { feedback: value.feedback } : {}) });
   }
   return pending;
+}
+
+/**
+ * Whether the person asked to see this target's plan again ("Review the
+ * plan"), for its current plan or the next one; false when the target cannot be
+ * named.
+ */
+export function codeGenerationPlanReviewRequested(
+  projectDir: string,
+  unit: string | null,
+  intentId: string = intentIdFor(projectDir),
+): boolean {
+  let targetId: string;
+  try {
+    targetId = codeGenerationTargetId({ unit });
+  } catch {
+    return false;
+  }
+  return planApprovalReviewRequested(projectDir, targetId, intentId) ||
+    planApprovalReviewRequested(projectDir, nextPlanReviewId(intentId), intentId);
+}
+
+/**
+ * A target whose plan stands only as its finished build reads it (a practice
+ * kept after its review, codeGenerationFinishedUnderPlanContract): "finishes"
+ * when its next step is the finish, "plan-review" while the person asked to see
+ * the plan again, which the plan question answers first. Null for any other
+ * target, or when it cannot be told. `next`, the write guard's refusal and the
+ * completion hold all read it, so they say the same.
+ */
+export function codeGenerationFinishedBuild(projectDir: string, unit: string | null): "finishes" | "plan-review" | null {
+  try {
+    if (!codeGenerationFinishedUnderPlanContract(projectDir, unit)) return null;
+    return codeGenerationPlanReviewRequested(projectDir, unit) ? "plan-review" : "finishes";
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the target's next step is the finish of its build (codeGenerationFinishedBuild). */
+export function codeGenerationBuildFinishes(projectDir: string, unit: string | null): boolean {
+  return codeGenerationFinishedBuild(projectDir, unit) === "finishes";
 }
 
 export function planApprovalReviewRequested(projectDir: string, targetId: string, intentId: string): boolean {
@@ -898,16 +942,10 @@ function targetState(
   record: PlanApprovalAskRecord | null,
   issued: CodeGenerationIssuance,
   planApprovalOff = false,
+  use: CodeGenerationApprovalUse = "build",
 ): TargetState {
-  const approval = evaluateCodeGenerationApproval(projectDir, { unit }, issued);
-  let targetId: string | null = null;
-  try {
-    targetId = codeGenerationTargetId({ unit });
-  } catch {
-    targetId = null;
-  }
-  const reviewRequested = targetId !== null && (planApprovalReviewRequested(projectDir, targetId, intentId) ||
-    planApprovalReviewRequested(projectDir, nextPlanReviewId(intentId), intentId));
+  const approval = evaluateCodeGenerationApproval(projectDir, { unit }, issued, use);
+  const reviewRequested = codeGenerationPlanReviewRequested(projectDir, unit, intentId);
   if (!reviewRequested && codeGenerationExecutionAllowed(projectDir, { unit }, approval, issued)) {
     return { unit, kind: "approved" };
   }
@@ -1005,7 +1043,15 @@ function routedPlanApproval(projectDir: string, directive: Directive): Directive
   // The plans asked about are the ones this directive builds, whatever the
   // engine said last (the question, a pause, or a directive a compacted chat
   // must re-read).
-  const states = units.map((unit) => targetState(projectDir, unit, intentId, record, directive, planApprovalOff));
+  // A Unit that owes only its completion receipt was built and reviewed: its
+  // plan is read as the completion reads it. A build directive keeps the build
+  // reading the guard and the brief use, so the plan `next` calls approved is
+  // one they admit (a reviewed stage-level build whose contract moved after its
+  // review gets its finish step instead, unless the person asked to see the
+  // plan again: finishedReviewStep, codeGenerationBuildFinishes).
+  const use: CodeGenerationApprovalUse =
+    directive.kind === "run-stage" && directive.unit_record_step !== undefined ? "completion" : "build";
+  const states = units.map((unit) => targetState(projectDir, unit, intentId, record, directive, planApprovalOff, use));
   if (states.every((state) => state.kind === "approved")) {
     // Under a lowered Guard Policy an approved plan that changed still builds;
     // the person hears what changed and is asked whether to go back to it, or,
