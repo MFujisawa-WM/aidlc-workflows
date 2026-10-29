@@ -58,6 +58,8 @@ import {
   readUnitClaimRegistryCache,
   readApplicableTeamUnitScopeStamp,
   readUnitMergeTransaction,
+  recordFileTargetOrThrow,
+  REQUEST_TEXT_DIR,
   readStateFile,
   readUnitGateRhythm,
   readUnitScopeStamp,
@@ -102,6 +104,7 @@ import {
   isCompiledExecutable,
   quoteCommandArgument,
 } from "./aidlc-runtime-paths.ts";
+import { readRequestFile } from "./aidlc-log.ts";
 
 const CLAIM_FILE = ".aidlc-unit-claim.json";
 const ZERO_OID = "0000000000000000000000000000000000000000";
@@ -2220,18 +2223,33 @@ function pinnedMergeGate(
 }
 
 // The merge gate as pin hands it to the agent: one question for the person,
-// asked in the pin's own turn, and the command that records each answer.
-function pinMergeGateStep(transaction: UnitMergeTransaction): Record<string, string> {
+// asked in the pin's own turn, and the command that records each answer. Their
+// reply goes in a request file the agent writes with its file tool and the
+// gate reads (readRequestFile), so no shell reads it on the way: PowerShell and
+// Git Bash quote an apostrophe differently. Pin makes the file's folder, since
+// some hosts' file tools make none, and removes a reply left there from an
+// earlier gate of this Unit (one a refused gate kept), which answers nothing
+// this pin asks.
+function pinMergeGateStep(pd: string, transaction: UnitMergeTransaction): Record<string, string> {
   const terms = pinnedMergeGate(transaction);
+  const file = `${REQUEST_TEXT_DIR}/gate-${transaction.unit.replace(/[^A-Za-z0-9._-]+/g, "-")}.txt`;
+  try {
+    const target = recordFileTargetOrThrow(pd, file);
+    mkdirSync(dirname(target), { recursive: true });
+    rmSync(target, { force: true });
+  } catch {
+    // A file tool that makes folders still writes it; the command is the same.
+  }
   const record = (decision: "approve" | "reject") =>
-    `${aidlcInvocation()} unit gate ${quoteCommandArgument(transaction.unit)} --decision ${decision} --user-input '<their answer>'`;
+    `${aidlcInvocation()} unit gate ${quoteCommandArgument(transaction.unit)} --decision ${decision} --request-file ${file}`;
   return {
     strategy: terms.strategy,
     target_branch: terms.target,
     ask:
       `Ask the person now, as one question, whether to merge Unit "${transaction.unit}" into ${terms.target}` +
       " (Approve or Reject), with the pinned commit and the files outside the Unit's folder above, then end your" +
-      " turn. Record their reply with the command for their choice.",
+      ` turn. Write their reply, as they typed it, to \`${file}\` with your file tool, not a shell, and record it` +
+      " with the command for their choice.",
     approve: record("approve"),
     reject: record("reject"),
   };
@@ -2380,7 +2398,7 @@ function pinUnit(args: string[], projectDir?: string): void {
     generation: claim.generation,
     evidence,
     gate_required: true,
-    merge_gate: pinMergeGateStep(transaction),
+    merge_gate: pinMergeGateStep(pd, transaction),
     ...(superseded
       ? { superseded: { pinned_oid: superseded.pinned_oid, status: superseded.status } }
       : {}),
@@ -2419,13 +2437,24 @@ function gateUnitMerge(args: string[], projectDir?: string): void {
   const { positional, flags } = parseArgs(args);
   const unit = positional[0];
   const decision = flags.decision;
-  const userInput = flags["user-input"]?.trim();
+  const pd = resolveProjectDir(projectDir);
+  // The person's words in the file the engine wrote for this command, so no
+  // shell reads them on the way (an apostrophe beside a ! or a $ is quoted one
+  // way for PowerShell and another for Git Bash); spent once recorded.
+  let userInput = flags["user-input"]?.trim();
+  let spend = (): void => {};
+  if (flags["request-file"] !== undefined) {
+    if (userInput) fail("Pass either --user-input or --request-file, not both.");
+    const read = readRequestFile(pd, flags["request-file"]);
+    if (typeof read === "string") fail(read);
+    userInput = read.text.trim();
+    spend = read.spend;
+  }
   if (!unit || (decision !== "approve" && decision !== "reject") || !userInput) {
     fail(
-      "Usage: aidlc-unit gate <unit> --decision <approve|reject> --user-input <text>",
+      "Usage: aidlc-unit gate <unit> --decision <approve|reject> (--user-input <text> | --request-file <file>)",
     );
   }
-  const pd = resolveProjectDir(projectDir);
   if (
     !humanPresenceGuardDisabled() &&
     isNonAnswer(userInput)
@@ -2463,6 +2492,7 @@ function gateUnitMerge(args: string[], projectDir?: string): void {
     ) &&
     existingDecision === decision
   ) {
+    spend();
     console.log(JSON.stringify({
       gated: true,
       recovered: true,
@@ -2501,6 +2531,7 @@ function gateUnitMerge(args: string[], projectDir?: string): void {
     target_branch: terms.target,
     strategy: terms.strategy,
   });
+  spend();
   console.log(JSON.stringify({
     gated: true,
     unit,
