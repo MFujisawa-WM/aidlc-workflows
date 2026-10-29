@@ -4159,6 +4159,13 @@ export async function main(rawArgv: string[]): Promise<void> {
         const { replacePreviousWindowsShimHelper } = await import("./aidlc-lifecycle.ts");
         replacePreviousWindowsShimHelper();
       }
+      // An activation run by a release from before bin\aidlc.exe left none, or
+      // left the Git Bash launcher beside it; this release catches up once.
+      const { binRoot } = await import("./aidlc-install-paths.ts");
+      if (!existsSync(join(binRoot(), "aidlc.exe")) || existsSync(join(binRoot(), "aidlc"))) {
+        const { catchUpWindowsExeCommand } = await import("./aidlc-lifecycle.ts");
+        catchUpWindowsExeCommand();
+      }
     } catch {
       // A binary run from outside an install has no helper to replace.
     }
@@ -4211,6 +4218,21 @@ export async function main(rawArgv: string[]): Promise<void> {
 }
 
 if (import.meta.main) {
+  // The bin copy on Windows, the one binary with aidlc.cmd beside it, hands the
+  // command to the active release instead of running it. Loaded only there, so
+  // the dispatcher's front gate and the lean projections keep their import graph.
+  if (process.platform === "win32" && existsSync(join(dirname(process.execPath), "aidlc.cmd"))) {
+    import("./aidlc-native-launcher.ts")
+      .then((m) => m.startNativeLauncher(), () => false)
+      .then((launched) => {
+        if (!launched) startDispatcher();
+      });
+  } else {
+    startDispatcher();
+  }
+}
+
+function startDispatcher(): void {
   // Kiro IDE's Command Prompt terminal: the tool runs itself as a child behind
   // a pointer line (commandPromptReplyTee), or notes at exit a reply Kiro
   // dropped, and rejoins the quote pair cmd.exe left on the words. Loaded only
