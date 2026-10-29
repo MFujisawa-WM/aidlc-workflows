@@ -937,10 +937,13 @@ const HARNESS_CLI: Record<
     minimumVersion: "2.24.1",
     install: "Kiro CLI is optional here: to run AI-DLC from a terminal, install or upgrade Kiro CLI to 2.24.1 or later; Kiro IDE-only installs may omit it.",
   },
+  // The adapter's object entry points ({ id, setup, server }) load from 1.18.29;
+  // OpenCode 2 reports 2.x.
   opencode: {
     command: "opencode",
     required: true,
-    install: "Install opencode and ensure `opencode --version` works.",
+    minimumVersion: "1.18.29",
+    install: "Install or upgrade opencode to 1.18.29 or later; OpenCode 2 works too.",
   },
 };
 

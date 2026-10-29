@@ -19,10 +19,12 @@ import {
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import createAdapter, {
+import adapterPlugin, {
   type PluginInput,
 } from "../../harness/opencode/plugin/aidlc-opencode-adapter.ts";
 import { windowsScriptLaunch } from "../../core/tools/aidlc-executable-path.ts";
+
+const createAdapter = adapterPlugin.server;
 import {
   createTestProject,
   seedAidlcMemory,
