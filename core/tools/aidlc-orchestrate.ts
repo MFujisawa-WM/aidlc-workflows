@@ -5280,7 +5280,9 @@ export interface TeamConstructionBoard {
   claimed: Array<{ unit: string; owner: string }>;
   claims: Array<{
     unit: string;
-    status: "claimed" | "released";
+    // The claim record's status, or "landed" where the overview reads the
+    // Unit's row as merged (the record keeps the claim after landing).
+    status: "claimed" | "released" | "landed";
     owner: string;
     generation: number;
     observedActivity: string;
@@ -5502,7 +5504,7 @@ function assembleTeamConstructionBoard(
     .sort((a, b) => compareBoardKeys(a.unit, b.unit))
     .map((claim) => ({
       unit: claim.unit,
-      status: claim.status,
+      status: claim.landed ? "landed" as const : claim.status,
       owner: claim.owner,
       generation: claim.generation,
       observedActivity: observedClaimActivity(claim),
