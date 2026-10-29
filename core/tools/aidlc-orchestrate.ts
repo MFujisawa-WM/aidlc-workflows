@@ -1049,7 +1049,7 @@ function hooksOffStop(
   const flags = parseNextFlags(nextArgs);
   if (
     flags.parseError || !nextEngagesWorkflow(nextArgs, flags) || flags.orchestratorVerb !== undefined ||
-    flags.pluginCommand !== undefined || flags.knowledgeCommand !== undefined ||
+    flags.pluginCommand !== undefined || flags.knowledgeCommand !== undefined || flags.unitCommand !== undefined ||
     flags.claim !== undefined || flags.release !== undefined
   ) return null;
   if (!hookActivation()?.agentStep) return null;
@@ -5857,6 +5857,7 @@ export interface ParsedFlags {
   pickedUp?: string; // --resume picking up the only work here: the person's one line for it
   pluginCommand?: Exclude<PluginCommand, { kind: "not-plugin" }>; // leading plugin noun: terminal list/sync/select/help/error
   knowledgeCommand?: Exclude<KnowledgeCommand, { kind: "not-knowledge" }>; // leading knowledge noun: terminal DocumentKB verbs/help/error
+  unitCommand?: string[]; // leading `unit <verb>` (unitCommandArgv): the person's Unit command, for the agent to run
   compose?: boolean; // leading `compose` verb: force the composer (front or in-flight)
   orchestratorVerb?: "park" | "team-board"; // leading orchestrator verb: terminal print naming that command
   orchestratorVerbArgs?: string[]; // allowlisted trailing args for team-board (--space <s>, --intent <i>, --snapshot)
@@ -6016,6 +6017,9 @@ export function parseNextFlags(argv: string[]): ParsedFlags {
   if (pluginCommand.kind !== "not-plugin") return { pluginCommand };
   const knowledgeCommand = parseKnowledgeCommand(args);
   if (knowledgeCommand.kind !== "not-knowledge") return { knowledgeCommand };
+  // A Unit command owns its whole argv, options included (`unit land alpha
+  // --step git`), so nothing on it is read as one of next's own flags.
+  if (reading.kind === "exact" && reading.unit !== undefined) return { unitCommand: reading.unit };
   // The pick question's answer, `next --pick <record>`: select that record and
   // carry on in the same turn, so picking work up takes one step. Words the
   // agent adds after the name, or the `--request <id>` of the step that kept
@@ -10622,7 +10626,7 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
   // swallowed. Inert on Claude/Codex: the latch files are never written there (no
   // seam) → fresh is always false → falls through. Advisory: any failure fails
   // open to the normal `next`.
-  if (!flags.readOnly && !flags.config && !flags.configCommand && !flags.workspaceCommand && !flags.orchestratorVerb && !flags.pluginCommand && !flags.knowledgeCommand && !flags.stage && !flags.phase &&
+  if (!flags.readOnly && !flags.config && !flags.configCommand && !flags.workspaceCommand && !flags.orchestratorVerb && !flags.pluginCommand && !flags.knowledgeCommand && !flags.unitCommand && !flags.stage && !flags.phase &&
       !flags.scope && !flags.positionalScope && !flags.intent && !flags.resume &&
       !flags.depth && !flags.testStrategy && !flags.projectType && !flags.review &&
       !flags.single && !flags.compose && !flags.newScope && !flags.report &&
@@ -10938,6 +10942,17 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
     const suffix = tail.length > 0 ? ` ${tail.map(shellArg).join(" ")}` : "";
     emit(turnEndingPrint(
       `Run \`${aidlcToolInvocation("knowledge")} ${verb}${suffix}\`, print its output verbatim, then stop. This is a terminal utility, NOT workflow work: do NOT run \`next\` and do NOT advance, resume, or run any workflow stage.`,
+    ));
+    return;
+  }
+
+  // Branch 1f - the person's own Unit command (`unit pin alpha`), never words
+  // for new work. The agent runs it, behind the host's own prompt: it changes
+  // git and reaches the shared remote, so no seam runs it off-band.
+  if (flags.unitCommand) {
+    const command = `${aidlcInvocation()} unit ${flags.unitCommand.map((arg) => quoteCommandArgument(arg)).join(" ")}`;
+    emit(turnEndingPrint(
+      `Run \`${command}\`, tell the person in plain words what it reports, then stop. This is the person's own Unit command, NOT workflow work: do NOT run \`next\` and do NOT advance, resume, or run any workflow stage.`,
     ));
     return;
   }
