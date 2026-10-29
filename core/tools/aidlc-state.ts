@@ -302,6 +302,14 @@ import {
   workflowUsageAuditFields,
 } from "./aidlc-usage.ts";
 import { codeGenerationCompletionPlanWaits, deriveTeamUnitProgressModel } from "./aidlc-orchestrate.ts";
+import {
+  askedQuestionFields,
+  commandChat,
+  latestAskedQuestion,
+  QUESTION_ID_FIELD,
+  questionShows,
+  shownAgainFields,
+} from "./aidlc-questions.ts";
 import { codeGenerationPlanWaitsStep, promotableTestingPosture } from "./aidlc-testing-posture.ts";
 import { approvedOverUnfinishedReview, approvedUnitChanges } from "./aidlc-construction-checkpoints.ts";
 
@@ -7029,7 +7037,33 @@ function gateAskFields(
     fields["Open Decisions"] = "0";
   }
   if (stage.workspace_requires) Object.assign(fields, sourceWorkFields());
+  // The gate's own question record (aidlc-questions.ts): what it shows is the
+  // brief rendered for it and the documents it is about.
+  let outputs: string | null = null;
+  try {
+    outputs = reviewArtifactFingerprint(pd, stage, unit, { stateContent: content });
+  } catch {
+    outputs = null;
+  }
+  Object.assign(fields, askedQuestionFields(pd, {
+    type: "gate",
+    shows: questionShows([fields["Brief Digest"], outputs ?? "none"]),
+  }));
   return fields;
+}
+
+// The gate already open, shown again: its question's id for the step, and a
+// QUESTION_SHOWN row when this chat had not seen it. Record-only.
+function openGateQuestionId(pd: string, slug: string, unit: string | null): string | null {
+  try {
+    const open = latestAskedQuestion(pd, { event: "STAGE_AWAITING_APPROVAL", type: "gate", stage: slug, unit });
+    if (open === null) return null;
+    const shown = shownAgainFields(pd, open.id, commandChat(pd));
+    if (shown !== null) emitAudit(pd, "QUESTION_SHOWN", shown);
+    return open.id;
+  } catch {
+    return null;
+  }
 }
 
 // Where the review-brief CLI keeps the renderings it printed for this gate.
@@ -7535,6 +7569,7 @@ function handleGateStart(args: string[]): void {
       );
     }
     if (status === "awaiting-approval") {
+      const questionId = openGateQuestionId(pd, slug, teamGate.unit);
       console.log(
         JSON.stringify({
           slug,
@@ -7543,19 +7578,21 @@ function handleGateStart(args: string[]): void {
           new_state: "awaiting-approval",
           already_awaiting_approval: true,
           revalidated: true,
+          ...(questionId !== null ? { question_id: questionId } : {}),
         }),
       );
       return;
     }
     const timestamp = isoTimestamp();
     content = setField(content, "Last Updated", timestamp);
+    const asked: Record<string, string> = {
+      ...teamGateFields(stage, teamGate),
+      ...(artifacts ? { Artifacts: artifacts } : {}),
+      ...(recovered ? { Recovered: "true" } : {}),
+      ...gateAskFields(pd, stage, content, teamGate.unit, []),
+    };
     try {
-      emitAudit(pd, "STAGE_AWAITING_APPROVAL", {
-        ...teamGateFields(stage, teamGate),
-        ...(artifacts ? { Artifacts: artifacts } : {}),
-        ...(recovered ? { Recovered: "true" } : {}),
-        ...gateAskFields(pd, stage, content, teamGate.unit, []),
-      });
+      emitAudit(pd, "STAGE_AWAITING_APPROVAL", asked);
     } catch (e) {
       error(`Audit emission failed: ${errorMessage(e)}`);
     }
@@ -7566,6 +7603,7 @@ function handleGateStart(args: string[]): void {
       gate_scope: teamGate.scope,
       new_state: "awaiting-approval",
       timestamp,
+      question_id: asked[QUESTION_ID_FIELD],
     }));
     return;
   }
@@ -7574,6 +7612,7 @@ function handleGateStart(args: string[]): void {
   admitStageAction(pd, content, stage, { action: "present-approval-gate", personCall: personCall() });
   verifyGateSensorArtifactsUnchanged(slug, gateSensorEvaluation);
   if (alreadyAwaiting) {
+    let questionId: string | null = null;
     if (
       gateSensorEvaluation.issues.length > 0 &&
       overrideBlockingSensors
@@ -7590,9 +7629,12 @@ function handleGateStart(args: string[]): void {
           true,
         );
         emitAudit(pd, "STAGE_AWAITING_APPROVAL", fields);
+        questionId = fields[QUESTION_ID_FIELD];
       } catch (e) {
         error(`Audit emission failed: ${errorMessage(e)}`);
       }
+    } else {
+      questionId = openGateQuestionId(pd, slug, null);
     }
     console.log(
       JSON.stringify({
@@ -7600,6 +7642,7 @@ function handleGateStart(args: string[]): void {
         new_state: "awaiting-approval",
         already_awaiting_approval: true,
         revalidated: true,
+        ...(questionId !== null ? { question_id: questionId } : {}),
       }),
     );
     return;
@@ -7610,6 +7653,7 @@ function handleGateStart(args: string[]): void {
   const timestamp = isoTimestamp();
   content = setField(content, "Last Updated", timestamp);
 
+  let questionId: string | undefined;
   try {
     const fields: Record<string, string> = {
       Stage: slug,
@@ -7624,6 +7668,7 @@ function handleGateStart(args: string[]): void {
       overrideBlockingSensors,
     );
     emitAudit(pd, "STAGE_AWAITING_APPROVAL", fields);
+    questionId = fields[QUESTION_ID_FIELD];
   } catch (e) {
     error(`Audit emission failed: ${errorMessage(e)}`);
   }
@@ -7634,6 +7679,7 @@ function handleGateStart(args: string[]): void {
     new_state: "awaiting-approval",
     timestamp,
     ...(together.length > 0 ? { approves_together: together } : {}),
+    ...(questionId !== undefined ? { question_id: questionId } : {}),
   }));
   });
 }
