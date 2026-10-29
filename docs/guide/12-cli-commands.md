@@ -732,13 +732,13 @@ merge gate.
   --user-input "Approve pinned candidate"
 ```
 
-Accepted decisions are `approve` and `reject`. The command requires a fresh
-`MERGE_DISPATCH_INVOKED` plus terminal dispatch result after the pin and a typed
-human turn. Every dispatch row must carry the pin output through
-`--pinned-oid <oid> --attempt-generation <n> --pin-id <uuid>`. Pinned Unit transactions require
-merge strategy so the reviewed OID remains a direct parent. A moved ref,
-changed generation, or HOLD-MERGE marker requires an explicit re-pin before
-approval.
+Accepted decisions are `approve` and `reject`. The command records the
+person's answer when a typed human turn follows the pin (pin's output names this
+command for each answer). A pinned Unit lands with a regular merge into the
+integration branch pin fetched, so the reviewed OID remains a direct parent. A
+moved ref, changed generation, or HOLD-MERGE marker requires an explicit re-pin
+before approval. On approve, its output names the land command (`land`), which
+the agent runs in the same turn.
 
 ### `/aidlc unit land <unit>` — Land the pinned transaction
 
@@ -749,7 +749,7 @@ approval.
 Landing first fetches the current integration branch and revalidates the
 approved evidence against the live Unit DAG, Unit kinds, and active per-Unit
 stage columns. Contract drift refuses before Git mutation and requires rebase,
-republish, re-pin, a new dispatch bracket, and a new merge gate. It then merges
+republish, re-pin, and a new merge gate. It then merges
 pinned content while retaining main-owned engine metadata, folds the Unit row,
 and finalizes the transported audit receipts. For crash recovery, run the
 idempotent steps separately:
